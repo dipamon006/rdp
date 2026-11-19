@@ -121,14 +121,21 @@ jobs:
             sudo -u rdpuser tigervncpasswd /home/rdpuser/.vnc/passwd
           sudo chmod 600 /home/rdpuser/.vnc/passwd
 
+          # No logind session under sudo, so create the runtime dir ourselves.
+          RDP_UID=$(id -u rdpuser)
+          sudo install -d -m 700 -o rdpuser -g rdpuser "/run/user/${RDP_UID}"
+
           sudo tee /home/rdpuser/.vnc/xstartup > /dev/null <<'EOF'
           #!/bin/sh
           unset SESSION_MANAGER
           unset DBUS_SESSION_BUS_ADDRESS
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export XDG_CONFIG_DIRS=/etc/xdg
+          export XDG_DATA_DIRS=/usr/local/share:/usr/share
           export XDG_SESSION_TYPE=x11
           export XDG_CURRENT_DESKTOP=XFCE
           export DESKTOP_SESSION=xfce
-          exec dbus-run-session -- startxfce4
+          exec dbus-launch --exit-with-session startxfce4
           EOF
 
           sudo chmod 755 /home/rdpuser/.vnc/xstartup
