@@ -1,0 +1,156 @@
+name: Ubuntu GNOME + Tailscale + VNC
+
+on:
+  workflow_dispatch:
+
+jobs:
+  gnome-desktop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Install GNOME, VNC, Browser & Extras
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+
+          # Core desktop
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            ubuntu-desktop-minimal \
+            gnome-session \
+            gnome-shell \
+            gnome-terminal \
+            gnome-system-monitor \
+            gnome-text-editor \
+            nautilus \
+            tigervnc-standalone-server \
+            tigervnc-tools \
+            dbus-x11 \
+            curl \
+            wget \
+            git \
+            unzip \
+            xdg-utils
+
+          # Browser (Firefox via snap is broken in CI — use Firefox deb)
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            firefox
+
+          # Chromium as backup
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            chromium-browser || true
+
+          # Useful extras
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            vlc \
+            gedit \
+            mousepad \
+            xarchiver \
+            gdebi \
+            net-tools \
+            htop
+
+      - name: Create User (admin / full sudo)
+        shell: bash
+        run: |
+          sudo useradd -m -s /bin/bash admin || true
+          echo "admin:1234" | sudo chpasswd
+          sudo usermod -aG sudo admin
+
+          # Passwordless sudo for CI convenience
+          echo "admin ALL=(ALL) NOPASSWD:ALL" | \
+            sudo tee /etc/sudoers.d/admin-nopasswd
+
+          sudo mkdir -p /home/admin/.vnc
+          sudo chown -R admin:admin /home/admin
+
+      - name: Install Tailscale
+        shell: bash
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Connect Tailscale
+        shell: bash
+        run: |
+          sudo tailscale up \
+            --auth-key="${{ secrets.TAILSCALE_AUTHKEY }}" \
+            --hostname="gh-gnome-${GITHUB_RUN_ID}"
+
+          for i in {1..30}; do
+            TS_IP=$(tailscale ip -4 2>/dev/null | head -n1)
+            [ -n "$TS_IP" ] && break
+            sleep 3
+          done
+
+          [ -z "$TS_IP" ] && echo "Tailscale failed" && exit 1
+
+          echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
+          echo "Tailscale IP: $TS_IP"
+
+      - name: Configure VNC for admin
+        shell: bash
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          sudo -u admin mkdir -p /home/admin/.vnc
+
+          # Set VNC password
+          printf '%s\n%s\nn\n' "$VNC_PASSWORD" "$VNC_PASSWORD" | \
+            sudo -u admin tigervncpasswd /home/admin/.vnc/passwd
+          sudo chmod 600 /home/admin/.vnc/passwd
+
+          # xstartup — launch GNOME session
+          sudo tee /home/admin/.vnc/xstartup > /dev/null <<'EOF'
+          #!/bin/bash
+          unset SESSION_MANAGER
+          unset DBUS_SESSION_BUS_ADDRESS
+          export XDG_SESSION_TYPE=x11
+          export GDK_BACKEND=x11
+          exec dbus-run-session -- gnome-session --session=ubuntu
+          EOF
+
+          sudo chmod +x /home/admin/.vnc/xstartup
+          sudo chown -R admin:admin /home/admin/.vnc
+
+      - name: Start VNC Server
+        shell: bash
+        run: |
+          sudo -u admin tigervncserver :1 \
+            -localhost no \
+            -geometry 1600x900 \
+            -depth 24 \
+            -SecurityTypes VncAuth \
+            -rfbauth /home/admin/.vnc/passwd
+
+          sleep 15
+          echo "VNC started on :1 (port 5901)"
+
+      - name: Verify VNC Port
+        shell: bash
+        run: |
+          if ! timeout 10 bash -c \
+            "</dev/tcp/$TAILSCALE_IP/5901"; then
+            echo "VNC port not reachable — dumping VNC log:"
+            cat /home/admin/.vnc/*.log || true
+            exit 1
+          fi
+          echo "VNC reachable at $TAILSCALE_IP:5901"
+
+      - name: Print Connection Info
+        shell: bash
+        run: |
+          echo "========================================"
+          echo "  GNOME DESKTOP READY"
+          echo "  VNC IP   : $TAILSCALE_IP"
+          echo "  VNC Port : 5901"
+          echo "  Username : admin"
+          echo "  Password : (VNC_PASSWORD secret)"
+          echo "========================================"
+
+      - name: Keep Alive
+        shell: bash
+        run: |
+          while true; do
+            echo "[$(date '+%H:%M:%S')] Running — $(uptime -p)"
+            sleep 300
+          done
