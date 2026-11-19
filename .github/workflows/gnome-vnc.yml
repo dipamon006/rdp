@@ -23,10 +23,28 @@ jobs:
           printf 'Package: snapd\nPin: release a=*\nPin-Priority: -10\n' | \
             sudo tee /etc/apt/preferences.d/no-snap > /dev/null
 
+      - name: Restore apt package cache
+        id: aptcache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/apt-debs
+          key: apt-debs-gnome-v1
+
       - name: Install GNOME + VNC + Chromium (no snap)
         shell: bash
         run: |
           set -Eeuo pipefail
+
+          # Retry stalled downloads instead of hanging; keep .deb files for the cache.
+          printf 'Acquire::Retries "5";\nAcquire::http::Timeout "15";\nAPT::Keep-Downloaded-Packages "true";\n' | \
+            sudo tee /etc/apt/apt.conf.d/99-fast > /dev/null
+          sudo rm -f /etc/apt/apt.conf.d/docker-clean
+
+          # Reuse .deb files from previous runs.
+          if [[ -d ~/apt-debs ]]; then
+            sudo cp -n ~/apt-debs/*.deb /var/cache/apt/archives/ 2>/dev/null || true
+            echo "Restored $(ls ~/apt-debs | wc -l) cached packages."
+          fi
 
           # Skip slow man-page index rebuilds and docs during install.
           echo 'man-db man-db/auto-update boolean false' | sudo debconf-set-selections
@@ -41,7 +59,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             gnome-session gnome-shell ubuntu-session gnome-settings-daemon \
             gnome-control-center gnome-terminal nautilus gnome-text-editor \
-            eog file-roller gnome-tweaks gnome-shell-extension-manager \
+            eog file-roller gnome-tweaks \
             gnome-shell-extension-ubuntu-dock gnome-shell-extension-appindicator \
             yaru-theme-gnome-shell yaru-theme-gtk yaru-theme-icon fonts-ubuntu \
             libgl1-mesa-dri xdg-desktop-portal-gnome \
@@ -49,6 +67,16 @@ jobs:
             tigervnc-standalone-server tigervnc-tools \
             curl wget git unzip net-tools htop gnupg \
             chromium
+
+          mkdir -p ~/apt-debs
+          cp -n /var/cache/apt/archives/*.deb ~/apt-debs/ 2>/dev/null || true
+
+      - name: Save apt package cache
+        if: steps.aptcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/apt-debs
+          key: apt-debs-gnome-v1
 
       - name: Create user
         shell: bash
