@@ -1,68 +1,71 @@
-name: Ubuntu GNOME + Tailscale + VNC
+name: XFCE Desktop + Tailscale + VNC
 
 on:
   workflow_dispatch:
 
 jobs:
-  gnome-desktop:
+  xfce-desktop:
     runs-on: ubuntu-24.04
     timeout-minutes: 350
 
     steps:
-      - name: Install GNOME, VNC, Browser & Extras
+      - name: Install XFCE + VNC + Browser (no snap)
         shell: bash
         run: |
           sudo apt-get update -qq
 
-          # Core desktop
+          # Remove snap entirely
+          sudo systemctl stop snapd || true
+          sudo apt-get purge -y snapd || true
+          sudo rm -rf /snap /var/snap /var/lib/snapd
+
+          # Prevent snap from coming back
+          sudo tee /etc/apt/preferences.d/no-snap <<'PREF'
+          Package: snapd
+          Pin: release a=*
+          Pin-Priority: -10
+          PREF
+
+          # XFCE desktop + VNC
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            ubuntu-desktop-minimal \
-            gnome-session \
-            gnome-shell \
-            gnome-terminal \
-            gnome-system-monitor \
-            gnome-text-editor \
-            nautilus \
+            xfce4 \
+            xfce4-goodies \
+            xfce4-terminal \
             tigervnc-standalone-server \
             tigervnc-tools \
             dbus-x11 \
-            curl \
-            wget \
-            git \
-            unzip \
-            xdg-utils
+            x11-xserver-utils \
+            curl wget git unzip net-tools htop
 
-          # Browser (Firefox via snap is broken in CI — use Firefox deb)
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            firefox
+          # Firefox (deb, not snap)
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://packages.mozilla.org/apt/repo-signing-key.gpg | \
+            sudo tee /etc/apt/keyrings/packages.mozilla.org.asc > /dev/null
+          echo "deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] \
+            https://packages.mozilla.org/apt mozilla main" | \
+            sudo tee /etc/apt/sources.list.d/mozilla.list
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y firefox
 
-          # Chromium as backup
+          # Extras
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            chromium-browser || true
-
-          # Useful extras
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            vlc \
-            gedit \
             mousepad \
+            ristretto \
             xarchiver \
-            gdebi \
-            net-tools \
-            htop
+            thunar \
+            vlc \
+            gedit
 
-      - name: Create User (admin / full sudo)
+      - name: Create User
         shell: bash
         run: |
-          sudo useradd -m -s /bin/bash admin || true
-          echo "admin:1234" | sudo chpasswd
-          sudo usermod -aG sudo admin
-
-          # Passwordless sudo for CI convenience
-          echo "admin ALL=(ALL) NOPASSWD:ALL" | \
-            sudo tee /etc/sudoers.d/admin-nopasswd
-
-          sudo mkdir -p /home/admin/.vnc
-          sudo chown -R admin:admin /home/admin
+          sudo useradd -m -s /bin/bash -U rdpuser || true
+          sudo usermod -p "$(openssl passwd -6 1234)" rdpuser
+          sudo usermod -aG sudo rdpuser
+          echo "rdpuser ALL=(ALL) NOPASSWD:ALL" | \
+            sudo tee /etc/sudoers.d/rdpuser-nopasswd
+          sudo mkdir -p /home/rdpuser/.vnc
+          sudo chown -R rdpuser:rdpuser /home/rdpuser
 
       - name: Install Tailscale
         shell: bash
@@ -74,7 +77,7 @@ jobs:
         run: |
           sudo tailscale up \
             --auth-key="${{ secrets.TAILSCALE_AUTHKEY }}" \
-            --hostname="gh-gnome-${GITHUB_RUN_ID}"
+            --hostname="xfce-${GITHUB_RUN_ID}"
 
           for i in {1..30}; do
             TS_IP=$(tailscale ip -4 2>/dev/null | head -n1)
@@ -83,46 +86,43 @@ jobs:
           done
 
           [ -z "$TS_IP" ] && echo "Tailscale failed" && exit 1
-
           echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
           echo "Tailscale IP: $TS_IP"
 
-      - name: Configure VNC for admin
+      - name: Configure VNC
         shell: bash
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
-          sudo -u admin mkdir -p /home/admin/.vnc
+          sudo -u rdpuser mkdir -p /home/rdpuser/.vnc
 
-          # Set VNC password
           printf '%s\n%s\nn\n' "$VNC_PASSWORD" "$VNC_PASSWORD" | \
-            sudo -u admin tigervncpasswd /home/admin/.vnc/passwd
-          sudo chmod 600 /home/admin/.vnc/passwd
+            sudo -u rdpuser tigervncpasswd /home/rdpuser/.vnc/passwd
+          sudo chmod 600 /home/rdpuser/.vnc/passwd
 
-          # xstartup — launch GNOME session
-          sudo tee /home/admin/.vnc/xstartup > /dev/null <<'EOF'
+          sudo tee /home/rdpuser/.vnc/xstartup > /dev/null <<'XSTART'
           #!/bin/bash
           unset SESSION_MANAGER
           unset DBUS_SESSION_BUS_ADDRESS
           export XDG_SESSION_TYPE=x11
-          export GDK_BACKEND=x11
-          exec dbus-run-session -- gnome-session --session=ubuntu
-          EOF
+          export XDG_CURRENT_DESKTOP=XFCE
+          exec startxfce4
+          XSTART
 
-          sudo chmod +x /home/admin/.vnc/xstartup
-          sudo chown -R admin:admin /home/admin/.vnc
+          sudo chmod +x /home/rdpuser/.vnc/xstartup
+          sudo chown -R rdpuser:rdpuser /home/rdpuser/.vnc
 
       - name: Start VNC Server
         shell: bash
         run: |
-          sudo -u admin tigervncserver :1 \
+          sudo -u rdpuser tigervncserver :1 \
             -localhost no \
             -geometry 1600x900 \
             -depth 24 \
             -SecurityTypes VncAuth \
-            -rfbauth /home/admin/.vnc/passwd
+            -rfbauth /home/rdpuser/.vnc/passwd
 
-          sleep 15
+          sleep 10
           echo "VNC started on :1 (port 5901)"
 
       - name: Verify VNC Port
@@ -130,8 +130,8 @@ jobs:
         run: |
           if ! timeout 10 bash -c \
             "</dev/tcp/$TAILSCALE_IP/5901"; then
-            echo "VNC port not reachable — dumping VNC log:"
-            cat /home/admin/.vnc/*.log || true
+            echo "VNC not reachable — log:"
+            cat /home/rdpuser/.vnc/*.log || true
             exit 1
           fi
           echo "VNC reachable at $TAILSCALE_IP:5901"
@@ -140,11 +140,11 @@ jobs:
         shell: bash
         run: |
           echo "========================================"
-          echo "  GNOME DESKTOP READY"
+          echo "  XFCE DESKTOP READY"
           echo "  VNC IP   : $TAILSCALE_IP"
           echo "  VNC Port : 5901"
-          echo "  Username : admin"
-          echo "  Password : (VNC_PASSWORD secret)"
+          echo "  User     : rdpuser"
+          echo "  Pass     : 1234"
           echo "========================================"
 
       - name: Keep Alive
