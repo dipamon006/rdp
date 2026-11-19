@@ -1,0 +1,317 @@
+name: GNOME Desktop + Tailscale + VNC
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  gnome-desktop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Remove snap completely
+        shell: bash
+        run: |
+          sudo systemctl stop snapd 2>/dev/null || true
+          sudo systemctl disable snapd 2>/dev/null || true
+          sudo apt-get purge -y snapd 2>/dev/null || true
+          sudo rm -rf /snap /var/snap /var/lib/snapd /root/snap
+          printf 'Package: snapd\nPin: release a=*\nPin-Priority: -10\n' | \
+            sudo tee /etc/apt/preferences.d/no-snap > /dev/null
+
+      - name: Install GNOME + VNC + Chromium (no snap)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          # Skip slow man-page index rebuilds and docs during install.
+          echo 'man-db man-db/auto-update boolean false' | sudo debconf-set-selections
+          sudo rm -f /var/lib/man-db/auto-update
+          printf 'path-exclude /usr/share/doc/*\npath-exclude /usr/share/man/*\npath-exclude /usr/share/info/*\n' | \
+            sudo tee /etc/dpkg/dpkg.cfg.d/01-nodoc > /dev/null
+
+          # Add the Chromium PPA first so one update covers everything.
+          sudo add-apt-repository -y --no-update ppa:xtradeb/apps
+          sudo apt-get update -qq
+
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            gnome-session gnome-shell ubuntu-session gnome-settings-daemon \
+            gnome-control-center gnome-terminal nautilus gnome-text-editor \
+            eog file-roller gnome-tweaks gnome-shell-extension-manager \
+            gnome-shell-extension-ubuntu-dock gnome-shell-extension-appindicator \
+            yaru-theme-gnome-shell yaru-theme-gtk yaru-theme-icon fonts-ubuntu \
+            libgl1-mesa-dri xdg-desktop-portal-gnome \
+            dbus-user-session dbus-x11 at-spi2-core x11-xserver-utils \
+            tigervnc-standalone-server tigervnc-tools \
+            curl wget git unzip net-tools htop gnupg \
+            chromium
+
+      - name: Create user
+        shell: bash
+        run: |
+          sudo useradd -m -s /bin/bash -U rdpuser || true
+          sudo usermod -p "$(openssl passwd -6 1234)" rdpuser
+          sudo usermod -aG sudo rdpuser
+          echo "rdpuser ALL=(ALL) NOPASSWD:ALL" | \
+            sudo tee /etc/sudoers.d/rdpuser-nopasswd
+          sudo mkdir -p /home/rdpuser/.vnc
+          sudo chown -R rdpuser:rdpuser /home/rdpuser
+
+      - name: Restore encrypted home backup
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          set -Eeuo pipefail
+
+          url=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=desktop-home-backup&per_page=20" \
+            --jq '[.artifacts[] | select(.expired == false)][0].archive_download_url // empty')
+
+          if [[ -z "$url" ]]; then
+            echo "No previous backup found. Starting with a fresh home."
+            exit 0
+          fi
+          if [[ -z "$BACKUP_PASSPHRASE" ]]; then
+            echo "Missing BACKUP_PASSPHRASE; cannot decrypt backup."
+            exit 1
+          fi
+
+          mkdir -p /tmp/restore
+          gh api "$url" > /tmp/restore/backup.zip
+          unzip -o -q /tmp/restore/backup.zip -d /tmp/restore
+
+          printf '%s' "$BACKUP_PASSPHRASE" | \
+            gpg --batch --yes --pinentry-mode loopback \
+              --passphrase-fd 0 \
+              --decrypt --output /tmp/restore/home.tar.gz \
+              /tmp/restore/home.tar.gz.gpg
+
+          sudo tar -xzf /tmp/restore/home.tar.gz -C /home/rdpuser
+          sudo chown -R rdpuser:rdpuser /home/rdpuser
+          rm -rf /tmp/restore
+          echo "Home restored from previous backup."
+
+      - name: Install Tailscale
+        shell: bash
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Connect Tailscale
+        shell: bash
+        run: |
+          sudo tailscale up \
+            --auth-key="${{ secrets.TAILSCALE_AUTHKEY }}" \
+            --hostname="gnome-${GITHUB_RUN_ID}"
+          for i in {1..30}; do
+            TS_IP=$(tailscale ip -4 2>/dev/null | head -n1)
+            [ -n "$TS_IP" ] && break
+            sleep 3
+          done
+          [ -z "$TS_IP" ] && echo "Tailscale failed" && exit 1
+          echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
+          echo "Tailscale IP: $TS_IP"
+
+      - name: Configure GNOME + VNC
+        shell: bash
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "$VNC_PASSWORD" ]]; then
+            echo "Missing VNC_PASSWORD secret."
+            exit 1
+          fi
+
+          # Runner image sets XDG_CONFIG_HOME=/home/runner/.config in
+          # /etc/environment. PAM would pass it to rdpuser, who cannot read it.
+          sudo sed -i '/^XDG_CONFIG_HOME=/d;/^XDG_CACHE_HOME=/d;/^XDG_DATA_HOME=/d' /etc/environment
+
+          # System-wide GNOME defaults: no lock screen, no idle blank,
+          # no animations (smoother over VNC).
+          sudo mkdir -p /etc/dconf/profile /etc/dconf/db/local.d
+          printf 'user-db:user\nsystem-db:local\n' | sudo tee /etc/dconf/profile/user > /dev/null
+          sudo tee /etc/dconf/db/local.d/00-vnc > /dev/null <<'EOF'
+          [org/gnome/desktop/screensaver]
+          lock-enabled=false
+          idle-activation-enabled=false
+
+          [org/gnome/desktop/session]
+          idle-delay=uint32 0
+
+          [org/gnome/desktop/lockdown]
+          disable-lock-screen=true
+
+          [org/gnome/desktop/interface]
+          enable-animations=false
+          color-scheme='prefer-dark'
+          gtk-theme='Yaru-dark'
+          icon-theme='Yaru'
+
+          [org/gnome/settings-daemon/plugins/power]
+          sleep-inactive-ac-type='nothing'
+          EOF
+          sudo dconf update
+
+          # VNC password.
+          sudo -u rdpuser mkdir -p /home/rdpuser/.vnc
+          printf '%s\n%s\nn\n' "$VNC_PASSWORD" "$VNC_PASSWORD" | \
+            sudo -u rdpuser tigervncpasswd /home/rdpuser/.vnc/passwd
+          sudo chmod 600 /home/rdpuser/.vnc/passwd
+
+          # Run VNC through the tigervncserver@ systemd unit. It opens a real
+          # PAM/logind session, which GNOME Shell needs (sudo does not).
+          echo ':1=rdpuser' | sudo tee /etc/tigervnc/vncserver.users > /dev/null
+
+          sudo tee /home/rdpuser/.vnc/tigervnc.conf > /dev/null <<'EOF'
+          $localhost = "no";
+          $geometry = "1600x900";
+          $depth = 24;
+          $SecurityTypes = "VncAuth";
+          $vncPasswdFile = "/home/rdpuser/.vnc/passwd";
+          1;
+          EOF
+
+          sudo tee /home/rdpuser/.vnc/xstartup > /dev/null <<'EOF'
+          #!/bin/sh
+          unset SESSION_MANAGER
+          export XDG_CONFIG_HOME="$HOME/.config"
+          export XDG_CACHE_HOME="$HOME/.cache"
+          export XDG_DATA_HOME="$HOME/.local/share"
+          export XDG_CONFIG_DIRS=/etc/xdg/xdg-ubuntu:/etc/xdg
+          export XDG_DATA_DIRS=/usr/share/ubuntu:/usr/local/share:/usr/share
+          export XDG_SESSION_TYPE=x11
+          export XDG_CURRENT_DESKTOP=ubuntu:GNOME
+          export XDG_SESSION_DESKTOP=ubuntu
+          export DESKTOP_SESSION=ubuntu
+          export GNOME_SHELL_SESSION_MODE=ubuntu
+          exec gnome-session --session=ubuntu
+          EOF
+
+          sudo chmod 755 /home/rdpuser/.vnc/xstartup
+          sudo chown -R rdpuser:rdpuser /home/rdpuser/.vnc
+
+      - name: Start VNC server
+        id: vnc
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          # Allow TCP 5901 only from loopback and Tailscale; drop everything else.
+          for ipt in iptables ip6tables; do
+            sudo "$ipt" -I INPUT 1 -p tcp --dport 5901 -j DROP
+            sudo "$ipt" -I INPUT 1 -p tcp --dport 5901 -i tailscale0 -j ACCEPT
+            sudo "$ipt" -I INPUT 1 -p tcp --dport 5901 -i lo -j ACCEPT
+          done
+
+          sudo systemctl start 'tigervncserver@:1.service'
+          sleep 15
+          sudo systemctl --no-pager status 'tigervncserver@:1.service' || true
+          loginctl list-sessions --no-legend || true
+
+          echo "started=true" >> "$GITHUB_OUTPUT"
+          echo "VNC started on ${TAILSCALE_IP}:5901"
+
+      - name: Verify VNC listener
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "Listening sockets on TCP 5901:"
+          sudo ss -ltnp 'sport = :5901' || true
+
+          for i in {1..20}; do
+            if timeout 3 bash -c "</dev/tcp/${TAILSCALE_IP}/5901" 2>/dev/null; then
+              echo "VNC TCP listener is reachable on ${TAILSCALE_IP}:5901"
+              pgrep -u rdpuser -a gnome-shell || echo "WARNING: gnome-shell not running yet"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "VNC did not become reachable."
+          sudo journalctl -u 'tigervncserver@:1.service' --no-pager -n 50 || true
+          echo "TigerVNC logs follow:"
+          sudo find /home/rdpuser/.vnc -maxdepth 1 -type f -name '*.log' \
+            -exec sh -c 'echo "--- $1"; tail -n 100 "$1"' _ {} \;
+          exit 1
+
+      - name: Print connection details
+        shell: bash
+        run: |
+          echo "=========================================="
+          echo "GNOME DESKTOP READY"
+          echo "VNC server : ${TAILSCALE_IP}:5901"
+          echo "Linux user : rdpuser"
+          echo "VNC secret : GitHub secret VNC_PASSWORD"
+          echo "=========================================="
+          echo "Viewer: vncviewer ${TAILSCALE_IP}:5901"
+          echo "The VNC password is not printed to workflow logs."
+
+      - name: Keep desktop alive
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          # Reserve roughly 65 minutes within the 350-minute job timeout
+          # for installation/restore at the beginning and backup at the end.
+          for ((i=1; i<=57; i++)); do
+            echo "[$(date '+%H:%M:%S')] GNOME running — $(uptime -p)"
+            sleep 300
+          done
+
+      - name: Stop VNC before backup
+        if: always()
+        shell: bash
+        run: |
+          sudo systemctl stop 'tigervncserver@:1.service' 2>/dev/null || true
+          sudo loginctl terminate-user rdpuser 2>/dev/null || true
+          sleep 3
+
+      - name: Create encrypted home backup
+        id: backup
+        if: always() && steps.vnc.outputs.started == 'true'
+        shell: bash
+        env:
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "$BACKUP_PASSPHRASE" ]]; then
+            echo "Missing BACKUP_PASSPHRASE; refusing to upload an unencrypted backup."
+            exit 1
+          fi
+
+          sudo tar -czf /tmp/home.tar.gz \
+            --exclude='./.cache' \
+            --exclude='./.vnc' \
+            --exclude='./.ssh' \
+            --exclude='./.Xauthority' \
+            --exclude='./.ICEauthority' \
+            --exclude='./.local/share/Trash' \
+            --exclude='./.local/share/keyrings' \
+            -C /home/rdpuser .
+
+          printf '%s' "$BACKUP_PASSPHRASE" | \
+            sudo gpg --batch --yes --pinentry-mode loopback \
+              --passphrase-fd 0 \
+              --symmetric --cipher-algo AES256 \
+              --output /tmp/home.tar.gz.gpg \
+              /tmp/home.tar.gz
+
+          sudo chmod 644 /tmp/home.tar.gz.gpg
+          sudo rm -f /tmp/home.tar.gz
+          echo "Encrypted backup ready."
+
+      - name: Upload persistent home backup
+        if: always() && steps.backup.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: desktop-home-backup
+          path: /tmp/home.tar.gz.gpg
+          if-no-files-found: error
