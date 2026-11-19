@@ -1,120 +1,128 @@
-name: XFCE Desktop + Tailscale + VNC
+          #!/bin/sh
+          unset SESSION_MANAGER
+          unset DBUS_SESSION_BUS_ADDRESS
+          export XDG_SESSION_TYPE=x11
+          export XDG_CURRENT_DESKTOP=XFCE
+          export DESKTOP_SESSION=xfce
+          exec dbus-run-session -- startxfce4
+          EOF
 
-on:
-  workflow_dispatch:
-
-jobs:
-  xfce-desktop:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 350
-
-    steps:
-      - name: Remove snap completely
-        shell: bash
-        run: |
-          sudo systemctl stop snapd 2>/dev/null || true
-          sudo systemctl disable snapd 2>/dev/null || true
-          sudo apt-get purge -y snapd 2>/dev/null || true
-          sudo rm -rf /snap /var/snap /var/lib/snapd /root/snap
-          printf 'Package: snapd\nPin: release a=*\nPin-Priority: -10\n' | \
-            sudo tee /etc/apt/preferences.d/no-snap > /dev/null
-
-      - name: Install XFCE + VNC + Chromium (no snap)
-        shell: bash
-        run: |
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            xfce4 xfce4-goodies xfce4-terminal \
-            tigervnc-standalone-server tigervnc-tools \
-            dbus-x11 x11-xserver-utils \
-            curl wget git unzip net-tools htop \
-            mousepad ristretto xarchiver thunar vlc
-          sudo add-apt-repository -y ppa:xtradeb/apps
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y chromium
-
-      - name: Create User
-        shell: bash
-        run: |
-          sudo useradd -m -s /bin/bash -U rdpuser || true
-          sudo usermod -p "$(openssl passwd -6 1234)" rdpuser
-          sudo usermod -aG sudo rdpuser
-          echo "rdpuser ALL=(ALL) NOPASSWD:ALL" | \
-            sudo tee /etc/sudoers.d/rdpuser-nopasswd
-          sudo mkdir -p /home/rdpuser/.vnc
-          sudo chown -R rdpuser:rdpuser /home/rdpuser
-
-      - name: Install Tailscale
-        shell: bash
-        run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
-
-      - name: Connect Tailscale
-        shell: bash
-        run: |
-          sudo tailscale up \
-            --auth-key="${{ secrets.TAILSCALE_AUTHKEY }}" \
-            --hostname="xfce-${GITHUB_RUN_ID}"
-          for i in {1..30}; do
-            TS_IP=$(tailscale ip -4 2>/dev/null | head -n1)
-            [ -n "$TS_IP" ] && break
-            sleep 3
-          done
-          [ -z "$TS_IP" ] && echo "Tailscale failed" && exit 1
-          echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
-          echo "Tailscale IP: $TS_IP"
-
-      - name: Configure VNC
-        shell: bash
-        env:
-          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
-        run: |
-          sudo -u rdpuser mkdir -p /home/rdpuser/.vnc
-          printf '%s\n%s\nn\n' "$VNC_PASSWORD" "$VNC_PASSWORD" | \
-            sudo -u rdpuser tigervncpasswd /home/rdpuser/.vnc/passwd
-          sudo chmod 600 /home/rdpuser/.vnc/passwd
-          printf '#!/bin/bash\nunset SESSION_MANAGER\nunset DBUS_SESSION_BUS_ADDRESS\nexport XDG_SESSION_TYPE=x11\nexport XDG_CURRENT_DESKTOP=XFCE\nexec startxfce4\n' | \
-            sudo tee /home/rdpuser/.vnc/xstartup > /dev/null
-          sudo chmod +x /home/rdpuser/.vnc/xstartup
+          sudo chmod 755 /home/rdpuser/.vnc/xstartup
           sudo chown -R rdpuser:rdpuser /home/rdpuser/.vnc
 
-      - name: Start VNC Server
+      - name: Start VNC server
+        id: vnc
         shell: bash
         run: |
-          sudo -u rdpuser tigervncserver :1 \
+          set -Eeuo pipefail
+
+          # Bind the VNC listener only to the Tailscale IPv4 address.
+          # It will not listen on the runner's public network interface.
+          sudo -H -u rdpuser tigervncserver :1 \
             -localhost no \
+            -interface "$TAILSCALE_IP" \
+            -UseIPv6=0 \
             -geometry 1600x900 \
             -depth 24 \
             -SecurityTypes VncAuth \
-            -rfbauth /home/rdpuser/.vnc/passwd
-          sleep 10
-          echo "VNC started on :1 (port 5901)"
+            -rfbauth /home/rdpuser/.vnc/passwd \
+            -xstartup /home/rdpuser/.vnc/xstartup
 
-      - name: Verify VNC Port
+          sleep 8
+          sudo -H -u rdpuser tigervncserver -list
+          echo "started=true" >> "$GITHUB_OUTPUT"
+          echo "VNC started on ${TAILSCALE_IP}:5901"
+
+      - name: Verify VNC listener
         shell: bash
         run: |
-          if ! timeout 10 bash -c "</dev/tcp/$TAILSCALE_IP/5901"; then
-            echo "VNC not reachable — log:"
-            cat /home/rdpuser/.vnc/*.log || true
-            exit 1
-          fi
-          echo "VNC reachable at $TAILSCALE_IP:5901"
+          set -Eeuo pipefail
 
-      - name: Print Connection Info
+          echo "Listening sockets on TCP 5901:"
+          sudo ss -ltnp 'sport = :5901' || true
+
+          for i in {1..20}; do
+            if timeout 3 bash -c "</dev/tcp/${TAILSCALE_IP}/5901" 2>/dev/null; then
+              echo "VNC TCP listener is reachable on ${TAILSCALE_IP}:5901"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "VNC did not become reachable. TigerVNC logs follow:"
+          sudo find /home/rdpuser/.vnc -maxdepth 1 -type f -name '*.log' \
+            -exec sh -c 'echo "--- $1"; tail -n 100 "$1"' _ {} \;
+          exit 1
+
+      - name: Print connection details
         shell: bash
         run: |
-          echo "========================================"
-          echo "  XFCE DESKTOP READY"
-          echo "  VNC IP   : $TAILSCALE_IP"
-          echo "  VNC Port : 5901"
-          echo "  User     : rdpuser"
-          echo "  Pass     : 1234"
-          echo "========================================"
+          echo "=========================================="
+          echo "XFCE DESKTOP READY"
+          echo "VNC server : ${TAILSCALE_IP}:5901"
+          echo "Linux user : rdpuser"
+          echo "VNC secret : GitHub secret VNC_PASSWORD"
+          echo "=========================================="
+          echo "Remmina protocol: VNC"
+          echo "Remmina server: ${TAILSCALE_IP}:5901"
+          echo "The VNC password is not printed to workflow logs."
 
-      - name: Keep Alive
+      - name: Keep desktop alive
         shell: bash
         run: |
-          while true; do
-            echo "[$(date '+%H:%M:%S')] Running — $(uptime -p)"
+          set -Eeuo pipefail
+
+          # Reserve roughly 65 minutes within the 350-minute job timeout
+          # for installation/restore at the beginning and backup at the end.
+          for ((i=1; i<=57; i++)); do
+            echo "[$(date '+%H:%M:%S')] XFCE running — $(uptime -p)"
             sleep 300
           done
+
+      - name: Stop VNC before backup
+        if: always()
+        shell: bash
+        run: |
+          sudo -H -u rdpuser tigervncserver -kill :1 2>/dev/null || true
+
+      - name: Create encrypted home backup
+        id: backup
+        if: always() && steps.vnc.outputs.started == 'true'
+        shell: bash
+        env:
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "$BACKUP_PASSPHRASE" ]]; then
+            echo "Missing BACKUP_PASSPHRASE; refusing to upload an unencrypted backup."
+            exit 1
+          fi
+
+          sudo tar -czf /tmp/xfce-home.tar.gz \
+            --exclude='./.cache' \
+            --exclude='./.vnc' \
+            --exclude='./.ssh' \
+            --exclude='./.Xauthority' \
+            --exclude='./.ICEauthority' \
+            --exclude='./.local/share/Trash' \
+            --exclude='./.local/share/keyrings' \
+            -C /home/rdpuser .
+
+          printf '%s' "$BACKUP_PASSPHRASE" | \
+            gpg --batch --yes --pinentry-mode loopback \
+              --passphrase-fd 0 \
+              --symmetric --cipher-algo AES256 \
+              --output /tmp/xfce-home.tar.gz.gpg \
+              /tmp/xfce-home.tar.gz
+
+          rm -f /tmp/xfce-home.tar.gz
+          echo "Encrypted backup ready."
+
+      - name: Upload persistent home backup
+        if: always() && steps.backup.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: xfce-home-backup
+          path: /tmp/xfce-home.tar.gz.gpg
+          if-no-files-found: error
