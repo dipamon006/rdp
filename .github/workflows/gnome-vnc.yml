@@ -27,16 +27,25 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+
+          # Skip slow man-page index rebuilds and docs during install.
+          echo 'man-db man-db/auto-update boolean false' | sudo debconf-set-selections
+          sudo rm -f /var/lib/man-db/auto-update
+          printf 'path-exclude /usr/share/doc/*\npath-exclude /usr/share/man/*\npath-exclude /usr/share/info/*\n' | \
+            sudo tee /etc/dpkg/dpkg.cfg.d/01-nodoc > /dev/null
+
+          # Add the Chromium PPA first so one update covers everything.
+          sudo add-apt-repository -y --no-update ppa:xtradeb/apps
           sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            xfce4 xfce4-goodies xfce4-terminal \
+
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            xfce4 xfce4-terminal xfce4-notifyd \
+            thunar mousepad ristretto xarchiver \
+            adwaita-icon-theme fonts-dejavu-core \
             tigervnc-standalone-server tigervnc-tools \
-            dbus-x11 x11-xserver-utils \
+            dbus-x11 x11-xserver-utils at-spi2-core \
             curl wget git unzip net-tools htop gnupg \
-            mousepad ristretto xarchiver thunar vlc
-          sudo add-apt-repository -y ppa:xtradeb/apps
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y chromium
+            chromium
 
       - name: Create user
         shell: bash
