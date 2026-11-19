@@ -62,7 +62,7 @@ jobs:
             eog file-roller gnome-tweaks
             gnome-shell-extension-ubuntu-dock gnome-shell-extension-appindicator
             yaru-theme-gnome-shell yaru-theme-gtk yaru-theme-icon fonts-ubuntu
-            libgl1-mesa-dri xdg-desktop-portal-gnome
+            libgl1-mesa-dri xdg-desktop-portal-gnome dconf-cli
             dbus-user-session dbus-x11 at-spi2-core x11-xserver-utils
             tigervnc-standalone-server tigervnc-tools
             curl wget git unzip net-tools htop gnupg
