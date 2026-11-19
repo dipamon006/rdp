@@ -13,171 +13,43 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Remove Snap
+      - name: Remove snap completely
         shell: bash
         run: |
-          set -Eeuo pipefail
-
-          sudo systemctl disable --now snapd.service snapd.socket 2>/dev/null || true
+          sudo systemctl stop snapd 2>/dev/null || true
+          sudo systemctl disable snapd 2>/dev/null || true
           sudo apt-get purge -y snapd 2>/dev/null || true
-          sudo rm -rf /var/snap /var/lib/snapd /root/snap
-          if [[ -L /snap ]]; then sudo rm -f /snap; fi
+          sudo rm -rf /snap /var/snap /var/lib/snapd /root/snap
+          printf 'Package: snapd\nPin: release a=*\nPin-Priority: -10\n' | \
+            sudo tee /etc/apt/preferences.d/no-snap > /dev/null
 
-          sudo tee /etc/apt/preferences.d/no-snap >/dev/null <<'EOF'
-          Package: snapd
-          Pin: release a=*
-          Pin-Priority: -10
-          EOF
-
-      - name: Install XFCE, VNC and desktop applications
+      - name: Install XFCE + VNC + Chromium (no snap)
         shell: bash
         run: |
           set -Eeuo pipefail
-          export DEBIAN_FRONTEND=noninteractive
-
-          sudo apt-get update
-          sudo apt-get install -y \
-            software-properties-common \
-            ca-certificates curl wget gnupg \
-            xfce4 xfce4-goodies xfce4-terminal xfce4-notifyd \
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xfce4 xfce4-goodies xfce4-terminal \
             tigervnc-standalone-server tigervnc-tools \
             dbus-x11 x11-xserver-utils \
-            git unzip net-tools htop \
-            mousepad ristretto xarchiver thunar vlc \
-            telegram-desktop p7zip-full \
-            python3 python3-pip python3-venv python3-tk \
-            libnotify-bin
-
-          sudo add-apt-repository -y universe
-
-          # Install Firefox from Mozilla's official APT repository,
-          # not Ubuntu's Firefox-to-Snap transitional package.
-          sudo install -d -m 0755 /etc/apt/keyrings
-          sudo curl -fsSL \
-            https://packages.mozilla.org/apt/repo-signing-key.gpg \
-            -o /etc/apt/keyrings/packages.mozilla.org.asc
-
-          EXPECTED_FINGERPRINT="35BAA0B33E9EB396F59CA838C0BA5CE6DC6315A3"
-          ACTUAL_FINGERPRINT="$(gpg --show-keys --with-colons \
-            /etc/apt/keyrings/packages.mozilla.org.asc \
-            | awk -F: '$1 == "fpr" { print $10; exit }')"
-
-          if [[ "$ACTUAL_FINGERPRINT" != "$EXPECTED_FINGERPRINT" ]]; then
-            echo "Mozilla repository signing-key fingerprint did not match."
-            exit 1
-          fi
-
-          echo "deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main" \
-            | sudo tee /etc/apt/sources.list.d/mozilla.list >/dev/null
-
-          sudo tee /etc/apt/preferences.d/mozilla >/dev/null <<'EOF'
-          Package: firefox
-          Pin: release o=Ubuntu
-          Pin-Priority: -1
-
-          Package: *
-          Pin: origin packages.mozilla.org
-          Pin-Priority: 1000
-          EOF
-
-          # Ubuntu 24.04's chromium-browser package is a Snap transition.
-          # Use the XtraDeb PPA for a native .deb Chromium package, and pin
-          # the PPA so it cannot replace unrelated Ubuntu packages.
+            curl wget git unzip net-tools htop gnupg \
+            mousepad ristretto xarchiver thunar vlc
           sudo add-apt-repository -y ppa:xtradeb/apps
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y chromium
 
-          sudo tee /etc/apt/preferences.d/xtradeb-chromium >/dev/null <<'EOF'
-          Package: chromium-browser
-          Pin: version 2:1snap*
-          Pin-Priority: -1
-
-          Package: chromium*
-          Pin: release o=LP-PPA-xtradeb-apps
-          Pin-Priority: 700
-
-          Package: *
-          Pin: release o=LP-PPA-xtradeb-apps
-          Pin-Priority: -1
-          EOF
-
-          sudo apt-get update
-
-          CHROMIUM_CANDIDATE="$(apt-cache policy chromium | awk '/Candidate:/ { print $2; exit }')"
-          if [[ -z "$CHROMIUM_CANDIDATE" || "$CHROMIUM_CANDIDATE" == "(none)" ]]; then
-            echo "No native Chromium package candidate was found in the XtraDeb PPA."
-            apt-cache policy chromium chromium-browser || true
-            exit 1
-          fi
-
-          sudo apt-get install -y firefox chromium
-
-          echo "Installed application versions:"
-          firefox --version || true
-          chromium --version || true
-          python3 --version
-          7z | head -n 2 || true
-
-      - name: Create desktop user
+      - name: Create user
         shell: bash
         run: |
-          set -Eeuo pipefail
+          sudo useradd -m -s /bin/bash -U rdpuser || true
+          sudo usermod -p "$(openssl passwd -6 1234)" rdpuser
+          sudo usermod -aG sudo rdpuser
+          echo "rdpuser ALL=(ALL) NOPASSWD:ALL" | \
+            sudo tee /etc/sudoers.d/rdpuser-nopasswd
+          sudo mkdir -p /home/rdpuser/.vnc
+          sudo chown -R rdpuser:rdpuser /home/rdpuser
 
-          if ! id rdpuser >/dev/null 2>&1; then
-            sudo useradd --create-home --shell /bin/bash rdpuser
-          fi
-
-          sudo install -d -o rdpuser -g rdpuser \
-            /home/rdpuser/Downloads \
-            /home/rdpuser/.vnc \
-            /home/rdpuser/.config/autostart \
-            /home/rdpuser/.local/bin
-
-          # VNC uses its own password. A Linux account password and
-          # passwordless sudo are not required for this VNC-only setup.
-          sudo chmod 700 /home/rdpuser/.vnc
-
-      - name: Install Tailscale
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          curl -fsSL https://tailscale.com/install.sh | sh
-          sudo systemctl enable --now tailscaled
-
-      - name: Connect Tailscale
-        shell: bash
-        env:
-          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-        run: |
-          set -Eeuo pipefail
-
-          if [[ -z "$TS_AUTH_KEY" ]]; then
-            echo "Missing GitHub secret: TAILSCALE_AUTHKEY"
-            exit 1
-          fi
-
-          sudo tailscale up \
-            --auth-key="$TS_AUTH_KEY" \
-            --hostname="xfce-${GITHUB_RUN_ID}" \
-            --accept-dns=false
-
-          TS_IP=""
-          for i in {1..30}; do
-            TS_IP="$(sudo tailscale ip -4 2>/dev/null | head -n 1 || true)"
-            if [[ -n "$TS_IP" ]]; then
-              break
-            fi
-            sleep 3
-          done
-
-          if [[ -z "$TS_IP" ]]; then
-            sudo tailscale status || true
-            echo "Tailscale did not assign an IPv4 address."
-            exit 1
-          fi
-
-          echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
-          echo "Tailscale connected: $TS_IP"
-
-      - name: Restore previous home-directory backup
+      - name: Restore encrypted home backup
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -185,171 +57,71 @@ jobs:
         run: |
           set -Eeuo pipefail
 
+          url=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=xfce-home-backup&per_page=20" \
+            --jq '[.artifacts[] | select(.expired == false)][0].archive_download_url // empty')
+
+          if [[ -z "$url" ]]; then
+            echo "No previous backup found. Starting with a fresh home."
+            exit 0
+          fi
           if [[ -z "$BACKUP_PASSPHRASE" ]]; then
-            echo "Missing GitHub secret: BACKUP_PASSPHRASE"
+            echo "Missing BACKUP_PASSPHRASE; cannot decrypt backup."
             exit 1
           fi
 
-          RESTORE_DIR="/tmp/xfce-restore"
-          mkdir -p "$RESTORE_DIR"
+          mkdir -p /tmp/restore
+          gh api "$url" > /tmp/restore/backup.zip
+          unzip -o -q /tmp/restore/backup.zip -d /tmp/restore
 
-          RUN_IDS="$(gh run list \
-            --workflow xfce-vnc.yml \
-            --status success \
-            --limit 20 \
-            --json databaseId \
-            --jq '.[].databaseId')"
+          printf '%s' "$BACKUP_PASSPHRASE" | \
+            gpg --batch --yes --pinentry-mode loopback \
+              --passphrase-fd 0 \
+              --decrypt --output /tmp/restore/xfce-home.tar.gz \
+              /tmp/restore/xfce-home.tar.gz.gpg
 
-          RESTORED=false
+          sudo tar -xzf /tmp/restore/xfce-home.tar.gz -C /home/rdpuser
+          sudo chown -R rdpuser:rdpuser /home/rdpuser
+          rm -rf /tmp/restore
+          echo "Home restored from previous backup."
 
-          while IFS= read -r RUN_ID; do
-            [[ -z "$RUN_ID" ]] && continue
-
-            rm -rf "$RESTORE_DIR"
-            mkdir -p "$RESTORE_DIR"
-
-            echo "Looking for a saved home backup in run $RUN_ID..."
-
-            if ! gh run download "$RUN_ID" \
-              --name xfce-home-backup \
-              --dir "$RESTORE_DIR" >/dev/null 2>&1; then
-              continue
-            fi
-
-            ENCRYPTED_ARCHIVE="$(find "$RESTORE_DIR" -type f \
-              -name 'xfce-home.tar.gz.gpg' -print -quit)"
-
-            [[ -z "$ENCRYPTED_ARCHIVE" ]] && continue
-
-            if printf '%s' "$BACKUP_PASSPHRASE" | \
-              gpg --batch --yes --pinentry-mode loopback \
-                --passphrase-fd 0 --decrypt "$ENCRYPTED_ARCHIVE" \
-                > "$RESTORE_DIR/xfce-home.tar.gz"; then
-
-              if sudo tar -xzf "$RESTORE_DIR/xfce-home.tar.gz" \
-                -C /home/rdpuser --no-same-owner; then
-                RESTORED=true
-                break
-              fi
-            fi
-
-            echo "That backup could not be restored; checking an older run."
-          done <<< "$RUN_IDS"
-
-          if [[ "$RESTORED" == true ]]; then
-            sudo chown -R rdpuser:rdpuser /home/rdpuser
-            echo "Previous home-directory backup restored."
-          else
-            echo "No usable previous backup found; starting with a fresh home directory."
-          fi
-
-      - name: Configure XFCE wallpaper and session notifications
+      - name: Install Tailscale
         shell: bash
         run: |
-          set -Eeuo pipefail
+          curl -fsSL https://tailscale.com/install.sh | sh
 
-          sudo install -d -o rdpuser -g rdpuser \
-            /home/rdpuser/.local/bin \
-            /home/rdpuser/.config/autostart
+      - name: Connect Tailscale
+        shell: bash
+        run: |
+          sudo tailscale up \
+            --auth-key="${{ secrets.TAILSCALE_AUTHKEY }}" \
+            --hostname="xfce-${GITHUB_RUN_ID}"
+          for i in {1..30}; do
+            TS_IP=$(tailscale ip -4 2>/dev/null | head -n1)
+            [ -n "$TS_IP" ] && break
+            sleep 3
+          done
+          [ -z "$TS_IP" ] && echo "Tailscale failed" && exit 1
+          echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
+          echo "Tailscale IP: $TS_IP"
 
-          sudo tee /home/rdpuser/.local/bin/set-xfce-wallpaper.sh >/dev/null <<'EOF'
-          #!/usr/bin/env bash
-          set -u
-          sleep 10
-
-          WALLPAPER="$(find /usr/share/backgrounds -type f \
-            \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' \) \
-            -print -quit 2>/dev/null || true)"
-
-          [[ -z "$WALLPAPER" ]] && exit 0
-          command -v xfconf-query >/dev/null 2>&1 || exit 0
-
-          mapfile -t PROPERTIES < <(
-            xfconf-query -c xfce4-desktop -lv 2>/dev/null \
-              | awk '$1 ~ /\/last-image$/ { print $1 }'
-          )
-
-          if (( ${#PROPERTIES[@]} > 0 )); then
-            for PROPERTY in "${PROPERTIES[@]}"; do
-              xfconf-query -c xfce4-desktop -p "$PROPERTY" \
-                --set "$WALLPAPER" 2>/dev/null || true
-            done
-          else
-            xfconf-query -c xfce4-desktop \
-              -p /backdrop/screen0/monitorVirtual1/workspace0/last-image \
-              --create --type string --set "$WALLPAPER" 2>/dev/null || true
-          fi
-          EOF
-
-          sudo tee /home/rdpuser/.local/bin/session-countdown.sh >/dev/null <<'EOF'
-          #!/usr/bin/env bash
-          set -u
-          sleep 20
-
-          notify-send 'Remote desktop started' \
-            'This XFCE session is scheduled to run for about 4 hours 45 minutes.' || true
-
-          sleep 3600
-          notify-send 'Remote desktop' '3 hours 45 minutes remaining.' || true
-
-          sleep 3600
-          notify-send 'Remote desktop' '2 hours 45 minutes remaining.' || true
-
-          sleep 3600
-          notify-send 'Remote desktop' '1 hour 45 minutes remaining.' || true
-
-          sleep 3600
-          notify-send 'Remote desktop' '45 minutes remaining.' || true
-
-          sleep 1800
-          notify-send -u critical 'Remote desktop' '15 minutes remaining. Save your work.' || true
-          EOF
-
-          sudo chmod 755 \
-            /home/rdpuser/.local/bin/set-xfce-wallpaper.sh \
-            /home/rdpuser/.local/bin/session-countdown.sh
-
-          sudo tee /home/rdpuser/.config/autostart/set-xfce-wallpaper.desktop >/dev/null <<'EOF'
-          [Desktop Entry]
-          Type=Application
-          Name=Set XFCE Wallpaper
-          Exec=/home/rdpuser/.local/bin/set-xfce-wallpaper.sh
-          Terminal=false
-          EOF
-
-          sudo tee /home/rdpuser/.config/autostart/session-countdown.desktop >/dev/null <<'EOF'
-          [Desktop Entry]
-          Type=Application
-          Name=Session Countdown
-          Exec=/home/rdpuser/.local/bin/session-countdown.sh
-          Terminal=false
-          EOF
-
-          sudo chown -R rdpuser:rdpuser \
-            /home/rdpuser/.local /home/rdpuser/.config
-
-      - name: Configure TigerVNC
+      - name: Configure VNC
         shell: bash
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
           set -Eeuo pipefail
 
-          if [[ -z "$VNC_PASSWORD" || ${#VNC_PASSWORD} -ne 8 ]]; then
-            echo "VNC_PASSWORD must be exactly 8 ASCII characters."
+          if [[ -z "$VNC_PASSWORD" ]]; then
+            echo "Missing VNC_PASSWORD secret."
             exit 1
           fi
 
-          # TigerVNC's password file is an obfuscated VNC credential.
-          # Generate it in filter mode instead of echoing the secret in logs.
-          printf '%s\n' "$VNC_PASSWORD" | \
-            sudo -H -u rdpuser tigervncpasswd -f | \
-            sudo tee /home/rdpuser/.vnc/passwd >/dev/null
-
-          sudo chown rdpuser:rdpuser /home/rdpuser/.vnc/passwd
+          sudo -u rdpuser mkdir -p /home/rdpuser/.vnc
+          printf '%s\n%s\nn\n' "$VNC_PASSWORD" "$VNC_PASSWORD" | \
+            sudo -u rdpuser tigervncpasswd /home/rdpuser/.vnc/passwd
           sudo chmod 600 /home/rdpuser/.vnc/passwd
 
-          sudo tee /home/rdpuser/.vnc/xstartup >/dev/null <<'EOF'
+          sudo tee /home/rdpuser/.vnc/xstartup > /dev/null <<'EOF'
           #!/bin/sh
           unset SESSION_MANAGER
           unset DBUS_SESSION_BUS_ADDRESS
@@ -478,11 +250,3 @@ jobs:
           name: xfce-home-backup
           path: /tmp/xfce-home.tar.gz.gpg
           if-no-files-found: error
-          retention-days: 90
-          compression-level: 0
-
-      - name: Disconnect Tailscale
-        if: always()
-        shell: bash
-        run: |
-          sudo tailscale logout || true
