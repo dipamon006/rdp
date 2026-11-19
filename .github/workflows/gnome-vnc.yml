@@ -16,41 +16,22 @@ jobs:
           sudo systemctl disable snapd 2>/dev/null || true
           sudo apt-get purge -y snapd 2>/dev/null || true
           sudo rm -rf /snap /var/snap /var/lib/snapd /root/snap
-
-          sudo tee /etc/apt/preferences.d/no-snap > /dev/null <<'PREF'
-Package: snapd
-Pin: release a=*
-Pin-Priority: -10
-PREF
+          printf 'Package: snapd\nPin: release a=*\nPin-Priority: -10\n' | \
+            sudo tee /etc/apt/preferences.d/no-snap > /dev/null
 
       - name: Install XFCE + VNC + Chromium (no snap)
         shell: bash
         run: |
           sudo apt-get update -qq
-
-          # XFCE desktop + VNC
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            xfce4 \
-            xfce4-goodies \
-            xfce4-terminal \
-            tigervnc-standalone-server \
-            tigervnc-tools \
-            dbus-x11 \
-            x11-xserver-utils \
-            curl wget git unzip net-tools htop
-
-          # Chromium deb (non-snap) via ungoogled-chromium PPA
+            xfce4 xfce4-goodies xfce4-terminal \
+            tigervnc-standalone-server tigervnc-tools \
+            dbus-x11 x11-xserver-utils \
+            curl wget git unzip net-tools htop \
+            mousepad ristretto xarchiver thunar vlc
           sudo add-apt-repository -y ppa:xtradeb/apps
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y chromium
-
-          # Light extras
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            mousepad \
-            ristretto \
-            xarchiver \
-            thunar \
-            vlc
 
       - name: Create User
         shell: bash
@@ -74,13 +55,11 @@ PREF
           sudo tailscale up \
             --auth-key="${{ secrets.TAILSCALE_AUTHKEY }}" \
             --hostname="xfce-${GITHUB_RUN_ID}"
-
           for i in {1..30}; do
             TS_IP=$(tailscale ip -4 2>/dev/null | head -n1)
             [ -n "$TS_IP" ] && break
             sleep 3
           done
-
           [ -z "$TS_IP" ] && echo "Tailscale failed" && exit 1
           echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
           echo "Tailscale IP: $TS_IP"
@@ -91,20 +70,11 @@ PREF
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
           sudo -u rdpuser mkdir -p /home/rdpuser/.vnc
-
           printf '%s\n%s\nn\n' "$VNC_PASSWORD" "$VNC_PASSWORD" | \
             sudo -u rdpuser tigervncpasswd /home/rdpuser/.vnc/passwd
           sudo chmod 600 /home/rdpuser/.vnc/passwd
-
-          sudo tee /home/rdpuser/.vnc/xstartup > /dev/null <<'XSTART'
-#!/bin/bash
-unset SESSION_MANAGER
-unset DBUS_SESSION_BUS_ADDRESS
-export XDG_SESSION_TYPE=x11
-export XDG_CURRENT_DESKTOP=XFCE
-exec startxfce4
-XSTART
-
+          printf '#!/bin/bash\nunset SESSION_MANAGER\nunset DBUS_SESSION_BUS_ADDRESS\nexport XDG_SESSION_TYPE=x11\nexport XDG_CURRENT_DESKTOP=XFCE\nexec startxfce4\n' | \
+            sudo tee /home/rdpuser/.vnc/xstartup > /dev/null
           sudo chmod +x /home/rdpuser/.vnc/xstartup
           sudo chown -R rdpuser:rdpuser /home/rdpuser/.vnc
 
@@ -117,15 +87,13 @@ XSTART
             -depth 24 \
             -SecurityTypes VncAuth \
             -rfbauth /home/rdpuser/.vnc/passwd
-
           sleep 10
           echo "VNC started on :1 (port 5901)"
 
       - name: Verify VNC Port
         shell: bash
         run: |
-          if ! timeout 10 bash -c \
-            "</dev/tcp/$TAILSCALE_IP/5901"; then
+          if ! timeout 10 bash -c "</dev/tcp/$TAILSCALE_IP/5901"; then
             echo "VNC not reachable — log:"
             cat /home/rdpuser/.vnc/*.log || true
             exit 1
