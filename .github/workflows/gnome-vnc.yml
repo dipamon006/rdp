@@ -56,17 +56,36 @@ jobs:
           sudo add-apt-repository -y --no-update ppa:xtradeb/apps
           sudo apt-get update -qq
 
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            gnome-session gnome-shell ubuntu-session gnome-settings-daemon \
-            gnome-control-center gnome-terminal nautilus gnome-text-editor \
-            eog file-roller gnome-tweaks \
-            gnome-shell-extension-ubuntu-dock gnome-shell-extension-appindicator \
-            yaru-theme-gnome-shell yaru-theme-gtk yaru-theme-icon fonts-ubuntu \
-            libgl1-mesa-dri xdg-desktop-portal-gnome \
-            dbus-user-session dbus-x11 at-spi2-core x11-xserver-utils \
-            tigervnc-standalone-server tigervnc-tools \
-            curl wget git unzip net-tools htop gnupg \
+          PKGS=(
+            gnome-session gnome-shell ubuntu-session gnome-settings-daemon
+            gnome-control-center gnome-terminal nautilus gnome-text-editor
+            eog file-roller gnome-tweaks
+            gnome-shell-extension-ubuntu-dock gnome-shell-extension-appindicator
+            yaru-theme-gnome-shell yaru-theme-gtk yaru-theme-icon fonts-ubuntu
+            libgl1-mesa-dri xdg-desktop-portal-gnome
+            dbus-user-session dbus-x11 at-spi2-core x11-xserver-utils
+            tigervnc-standalone-server tigervnc-tools
+            curl wget git unzip net-tools htop gnupg
             chromium
+          )
+
+          # apt downloads one file at a time; the mirror is slow per connection.
+          # Fetch all .deb files in parallel with aria2, then let apt install them.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends aria2
+          sudo apt-get install -qq --print-uris -y --no-install-recommends "${PKGS[@]}" | \
+            awk -F"'" '/^'"'"'http/ { split($3, a, " "); printf "%s\n  out=%s\n", $2, a[1] }' \
+            > /tmp/apt-uris.txt
+          echo "Downloading $(grep -c '^http' /tmp/apt-uris.txt || true) packages in parallel..."
+          if [[ -s /tmp/apt-uris.txt ]]; then
+            sudo aria2c -i /tmp/apt-uris.txt -d /var/cache/apt/archives \
+              -j 16 -x 4 -s 4 --max-tries=5 --retry-wait=2 --timeout=20 \
+              --auto-file-renaming=false --allow-overwrite=true \
+              --console-log-level=warn --summary-interval=0 || \
+              echo "Some parallel downloads failed; apt will fetch the rest."
+          fi
+
+          # apt checks every file's hash and downloads anything still missing.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${PKGS[@]}"
 
           mkdir -p ~/apt-debs
           cp -n /var/cache/apt/archives/*.deb ~/apt-debs/ 2>/dev/null || true
