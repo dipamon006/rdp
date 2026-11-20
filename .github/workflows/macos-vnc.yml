@@ -25,13 +25,18 @@ jobs:
           set -Eeuo pipefail
           if [[ -z "$VNC_PASSWORD" ]]; then echo "Missing VNC_PASSWORD secret."; exit 1; fi
 
-          # The desktop is the already logged-in 'runner' user. Give it the same
-          # password so the lock screen and admin prompts can be answered.
-          sudo dscl . -passwd /Users/runner "$VNC_PASSWORD"
+          # The desktop is the already logged-in 'runner' user, whose password
+          # cannot be changed without the old one. Add a separate admin user
+          # 'rdpuser' for admin password prompts instead.
+          if ! id rdpuser >/dev/null 2>&1; then
+            sudo sysadminctl -addUser rdpuser -fullName "RDP User" \
+              -password "$VNC_PASSWORD" -admin
+          fi
 
-          # No sleep, no display sleep, no screensaver.
+          # No sleep, no display sleep, no screensaver, no lock-screen password.
           sudo pmset -a sleep 0 displaysleep 0 disksleep 0
           defaults -currentHost write com.apple.screensaver idleTime 0
+          defaults write com.apple.screensaver askForPassword -int 0
           sudo defaults write /Library/Preferences/com.apple.screensaver loginWindowIdleTime 0
 
       - name: Find previous backup
@@ -132,7 +137,8 @@ jobs:
           echo "=========================================="
           echo "MACOS DESKTOP READY"
           echo "VNC server : ${TAILSCALE_IP}:5900"
-          echo "User       : runner"
+          echo "Desktop    : runner (already logged in)"
+          echo "Admin user : rdpuser (password = VNC_PASSWORD) for admin prompts"
           echo "Password   : GitHub secret VNC_PASSWORD"
           echo "=========================================="
           echo "Connect: vncviewer ${TAILSCALE_IP}:5900"
