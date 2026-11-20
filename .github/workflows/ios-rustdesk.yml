@@ -329,8 +329,16 @@ jobs:
               devs = [d for d in data[rt] if d["name"].startswith(kind)]
               if not devs:
                   continue
-              pro = [d for d in devs if "Pro" in d["name"] and "Max" not in d["name"]]
-              pick = (pro or devs)[-1]
+              def score(n):
+                  # Big, sharp models first; never the small ones by accident.
+                  prefs = (["iPad Pro 13", "iPad Air 13", "iPad Pro 11", "iPad Air 11", "iPad ("]
+                           if kind == "iPad" else
+                           ["iPhone 17 Pro", "iPhone 16 Pro", "iPhone 17", "iPhone 16", "iPhone 15 Pro"])
+                  for i, p in enumerate(prefs):
+                      if n.startswith(p) and "Max" not in n and "mini" not in n:
+                          return i
+                  return 99 if "mini" not in n else 100
+              pick = sorted(devs, key=lambda d: score(d["name"]))[0]
               print(pick["udid"]); print(pick["name"], file=sys.stderr); print(rt, file=sys.stderr)
               break
           ')
@@ -353,10 +361,22 @@ jobs:
 
           xcrun simctl boot "$UDID" || true
           xcrun simctl bootstatus "$UDID" -b
+          # Hide the Mac Dock so the device gets the whole screen.
+          defaults write com.apple.dock autohide -bool true
+          defaults write com.apple.dock autohide-delay -float 1000
+          killall Dock 2>/dev/null || true
+
           open -a Simulator --args -CurrentDeviceUDID "$UDID"
-          sleep 5
-          # Bring the Simulator window to the front.
-          osascript -e 'tell application "Simulator" to activate' || true
+          sleep 8
+          # iPad in landscape (fits the 16:9 screen); then "Fit Screen" so the
+          # device fills the display instead of a small, downscaled window.
+          if [[ "$DEVICE" == "ipad" ]]; then
+            osascript -e 'tell application "System Events" to tell process "Simulator" to click menu item "Rotate Left" of menu "Device" of menu bar 1' || true
+            sleep 2
+          fi
+          osascript -e 'tell application "Simulator" to activate' \
+                    -e 'tell application "System Events" to tell process "Simulator" to click menu item "Fit Screen" of menu "Window" of menu bar 1' \
+            || echo "Could not set Fit Screen (use Window > Fit Screen in the Simulator)."
           echo "started=true" >> "$GITHUB_OUTPUT"
 
       - name: Print connection details
