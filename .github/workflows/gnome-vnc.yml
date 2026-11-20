@@ -13,6 +13,10 @@ jobs:
     timeout-minutes: 350
 
     steps:
+      - name: Record job start time
+        shell: bash
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Remove snap completely
         shell: bash
         run: |
@@ -205,6 +209,17 @@ jobs:
           EOF
           sudo dconf update
 
+          # Block power off / reboot / suspend from the desktop. Powering off the
+          # runner kills the job before the backup runs. Use Log Out instead.
+          sudo tee /etc/polkit-1/rules.d/10-no-poweroff.rules > /dev/null <<'EOF'
+          polkit.addRule(function (action, subject) {
+            if (subject.user == "rdpuser" &&
+                /^org\.freedesktop\.login1\.(power-off|reboot|halt|suspend|hibernate)/.test(action.id)) {
+              return polkit.Result.NO;
+            }
+          });
+          EOF
+
           # VNC password.
           sudo -u rdpuser mkdir -p /home/rdpuser/.vnc
           printf '%s\n%s\nn\n' "$VNC_PASSWORD" "$VNC_PASSWORD" | \
@@ -305,11 +320,24 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          # Reserve roughly 65 minutes within the 350-minute job timeout
-          # for installation/restore at the beginning and backup at the end.
-          for ((i=1; i<=57; i++)); do
-            echo "[$(date '+%H:%M:%S')] GNOME running — $(uptime -p)"
-            sleep 300
+          # Stay up until 330 minutes after job start. That leaves 20 minutes
+          # before the 350-minute timeout to stop VNC, back up and upload.
+          # Logging out of GNOME ends the VNC session; then go straight to backup.
+          deadline=$(( JOB_START + 330 * 60 ))
+          down=0
+          while (( $(date +%s) < deadline )); do
+            if systemctl is-active --quiet 'tigervncserver@:1.service'; then
+              down=0
+            else
+              down=$((down + 1))
+              if (( down >= 2 )); then
+                echo "Desktop session ended (logged out). Starting backup."
+                exit 0
+              fi
+            fi
+            left=$(( (deadline - $(date +%s)) / 60 ))
+            echo "[$(date '+%H:%M:%S')] GNOME running — ${left} min left before backup"
+            sleep 60
           done
 
       - name: Stop VNC before backup
