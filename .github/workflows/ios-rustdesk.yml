@@ -187,7 +187,17 @@ jobs:
           # RustDesk streams the screen as compressed video (like RDP), so it
           # copes with high latency much better than VNC. Connect directly to
           # the Tailscale IP; no RustDesk servers are involved.
-          brew install --cask rustdesk
+          # Pinned: RustDesk 1.5.x's new password storage rejects password
+          # changes on these runners ("rejected by daemon"); 1.4.6 does not.
+          RD_VER=1.4.6
+          ARCH=$([[ "$(uname -m)" == arm64 ]] && echo aarch64 || echo x86_64)
+          curl -fL --retry 3 -o /tmp/rustdesk.dmg \
+            "https://github.com/rustdesk/rustdesk/releases/download/${RD_VER}/rustdesk-${RD_VER}-${ARCH}.dmg"
+          MNT=$(hdiutil attach -nobrowse -readonly /tmp/rustdesk.dmg | awk -F'\t' '/\/Volumes\//{print $NF; exit}')
+          sudo rm -rf /Applications/RustDesk.app
+          sudo cp -R "$MNT/RustDesk.app" /Applications/
+          hdiutil detach "$MNT" -quiet || true
+          sudo xattr -dr com.apple.quarantine /Applications/RustDesk.app 2>/dev/null || true
           APP=/Applications/RustDesk.app/Contents/MacOS
           RUNNER_UID=$(id -u runner)
 
@@ -248,7 +258,7 @@ jobs:
           sudo "$APP/RustDesk" --option approve-mode password
           # The daemon can reject this until it has fully started; retry.
           ok=""
-          for i in {1..20}; do
+          for i in {1..10}; do
             out=$(sudo "$APP/RustDesk" --password "$VNC_PASSWORD" 2>&1 || true)
             echo "$out"
             if grep -q 'Done' <<<"$out"; then ok=1; break; fi
