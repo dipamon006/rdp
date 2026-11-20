@@ -21,12 +21,21 @@ jobs:
       - name: Create user and enable RDP
         shell: pwsh
         env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if (-not $env:RDP_PASSWORD) { throw "Missing RDP_PASSWORD secret." }
+          if (-not $env:VNC_PASSWORD) { throw "Missing VNC_PASSWORD secret." }
 
-          $pw = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          # Accept the same (possibly short/simple) password as the VNC desktop:
+          # turn off Windows password complexity and minimum length.
+          secedit /export /cfg C:\pw.inf /areas SECURITYPOLICY | Out-Null
+          (Get-Content C:\pw.inf) -replace '^PasswordComplexity\s*=.*', 'PasswordComplexity = 0' `
+            -replace '^MinimumPasswordLength\s*=.*', 'MinimumPasswordLength = 0' |
+            Set-Content C:\pw.inf -Encoding Unicode
+          secedit /configure /db C:\Windows\security\local.sdb /cfg C:\pw.inf /areas SECURITYPOLICY /quiet
+          Remove-Item C:\pw.inf
+
+          $pw = ConvertTo-SecureString $env:VNC_PASSWORD -AsPlainText -Force
           if (-not (Get-LocalUser -Name rdpuser -ErrorAction SilentlyContinue)) {
             New-LocalUser -Name rdpuser -Password $pw -PasswordNeverExpires -AccountNeverExpires | Out-Null
           }
@@ -155,7 +164,7 @@ jobs:
           Write-Host "WINDOWS DESKTOP READY"
           Write-Host "RDP server : $($env:TAILSCALE_IP):3389"
           Write-Host "User       : rdpuser"
-          Write-Host "Password   : GitHub secret RDP_PASSWORD"
+          Write-Host "Password   : GitHub secret VNC_PASSWORD"
           Write-Host "=========================================="
           Write-Host "Linux: xfreerdp3 /v:$($env:TAILSCALE_IP) /u:rdpuser /dynamic-resolution +clipboard"
           Write-Host "End the session with Start > rdpuser > Sign out (not Shut down)."
