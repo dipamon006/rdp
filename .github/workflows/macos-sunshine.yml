@@ -193,6 +193,8 @@ jobs:
           vt_software = allowed
           vt_realtime = enabled
           EOF
+          # Allow the web UI to be used from the Tailscale address (CSRF check).
+          echo "csrf_allowed_origins = https://${TAILSCALE_IP}:47990" >> "$CONF_DIR/sunshine.conf"
 
           # Web UI login: user 'rdpuser', password = VNC_PASSWORD.
           "$SUN" --creds rdpuser "$VNC_PASSWORD" "$CONF_DIR/sunshine.conf" || true
