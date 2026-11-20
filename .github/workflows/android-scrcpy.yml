@@ -59,9 +59,25 @@ jobs:
           echo "$SDK/platform-tools" >> "$GITHUB_PATH"
           echo "$SDK/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
 
-          yes | "$SDKM" --licenses > /dev/null || true
-          "$SDKM" --install "$IMAGE" "emulator" "platform-tools" > /dev/null
-          echo "Installed $IMAGE"
+          yes 2>/dev/null | "$SDKM" --licenses > /dev/null || true
+          df -h "$SDK" | tail -n 1
+
+          # The ~1.5 GB system image download sometimes arrives truncated
+          # ("Error on ZipFile unknown archive"). Clear partial files and retry.
+          for attempt in 1 2 3 4; do
+            sudo rm -rf "$SDK/.temp" "$SDK/.downloadIntermediates" "$HOME/.android/cache" 2>/dev/null || true
+            if "$SDKM" --install "$IMAGE" "emulator" "platform-tools" > /tmp/sdkmanager.log 2>&1 \
+               && [[ -d "$SDK/system-images/android-${{ inputs.api }}/google_apis_playstore/x86_64" ]]; then
+              echo "Installed $IMAGE (attempt $attempt)"
+              exit 0
+            fi
+            echo "Attempt $attempt failed:"
+            grep -iE 'error|warning' /tmp/sdkmanager.log | tail -n 5 || true
+            sleep 10
+          done
+          echo "Could not install $IMAGE."
+          tail -n 40 /tmp/sdkmanager.log
+          exit 1
 
       - name: Create virtual device
         shell: bash
