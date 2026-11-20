@@ -1,0 +1,272 @@
+name: Android Emulator + Tailscale + scrcpy
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: "Device type"
+        type: choice
+        default: phone
+        options:
+          - phone
+          - tablet
+      api:
+        description: "Android version (API level): 34 = Android 14, 35 = Android 15"
+        type: choice
+        default: "34"
+        options:
+          - "34"
+          - "35"
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  AVD_NAME: dev
+  ANDROID_AVD_HOME: /mnt/avd
+  BACKUP_NAME: android-${{ inputs.device }}-${{ inputs.api }}-backup
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Record job start time
+        shell: bash
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Enable KVM
+        shell: bash
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | \
+            sudo tee /etc/udev/rules.d/99-kvm4all.rules > /dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Install emulator and system image
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          SDK="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          IMAGE="system-images;android-${{ inputs.api }};google_apis_playstore;x86_64"
+          echo "SDK=$SDK" >> "$GITHUB_ENV"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "$SDK/emulator" >> "$GITHUB_PATH"
+          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
+          echo "$SDK/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" --install "$IMAGE" "emulator" "platform-tools" > /dev/null
+          echo "Installed $IMAGE"
+
+      - name: Create virtual device
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo mkdir -p "$ANDROID_AVD_HOME"
+          sudo chown "$USER" "$ANDROID_AVD_HOME"
+
+          # Pick the newest available device profile.
+          devices=$(avdmanager list device -c)
+          if [[ "${{ inputs.device }}" == "tablet" ]]; then
+            candidates=(pixel_tablet pixel_c "Nexus 10")
+          else
+            candidates=(pixel_8 pixel_7 pixel_6 pixel_5)
+          fi
+          profile=""
+          for c in "${candidates[@]}"; do
+            if grep -qxF "$c" <<<"$devices"; then profile="$c"; break; fi
+          done
+          [[ -n "$profile" ]] || { echo "No device profile found"; echo "$devices"; exit 1; }
+          echo "Using device profile: $profile"
+
+          echo no | avdmanager create avd -n "$AVD_NAME" -k "$IMAGE" -d "$profile" --force
+
+          # 8 GB data partition, hardware keyboard, 6 GB RAM.
+          CFG="$ANDROID_AVD_HOME/$AVD_NAME.avd/config.ini"
+          sed -i '/^disk.dataPartition.size=/d;/^hw.keyboard=/d;/^hw.ramSize=/d' "$CFG"
+          printf 'disk.dataPartition.size=8G\nhw.keyboard=yes\nhw.ramSize=6144\n' >> "$CFG"
+
+      - name: Find previous backup
+        id: findbackup
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_id=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${BACKUP_NAME}&per_page=20" \
+            --jq '[.artifacts[] | select(.expired == false)][0].workflow_run.id // empty')
+          echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
+          if [[ -n "$run_id" ]]; then echo "Found ${BACKUP_NAME} from run ${run_id}"; else echo "No previous backup for this device/version."; fi
+
+      - name: Download previous backup
+        if: steps.findbackup.outputs.run_id != ''
+        uses: actions/download-artifact@v5
+        with:
+          name: ${{ env.BACKUP_NAME }}
+          run-id: ${{ steps.findbackup.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: /mnt/restore
+
+      - name: Restore device data
+        if: steps.findbackup.outputs.run_id != ''
+        shell: bash
+        env:
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          set -Eeuo pipefail
+          if [[ -z "$BACKUP_PASSPHRASE" ]]; then echo "Missing BACKUP_PASSPHRASE; cannot decrypt backup."; exit 1; fi
+          printf '%s' "$BACKUP_PASSPHRASE" | \
+            gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+              --decrypt /mnt/restore/device.tar.zst.gpg | \
+            tar -I zstd -xf - -C "$ANDROID_AVD_HOME/$AVD_NAME.avd"
+          rm -rf /mnt/restore
+          echo "Device data restored (apps, accounts, files)."
+
+      - name: Install and connect Tailscale
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --auth-key="${{ secrets.TAILSCALE_AUTHKEY }}" \
+            --hostname="android-${GITHUB_RUN_ID}"
+          for i in {1..30}; do
+            TS_IP=$(tailscale ip -4 2>/dev/null | head -n1 || true)
+            [[ -n "$TS_IP" ]] && break
+            sleep 3
+          done
+          [[ -z "$TS_IP" ]] && { echo "Tailscale failed"; exit 1; }
+          echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
+          echo "Tailscale IP: $TS_IP"
+
+      - name: Start emulator
+        id: emu
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          nohup emulator -avd "$AVD_NAME" -no-window -no-audio -no-boot-anim \
+            -gpu swiftshader_indirect -cores 4 -memory 6144 -no-snapshot \
+            -accel on > /tmp/emulator.log 2>&1 &
+          disown
+
+          adb wait-for-device
+          echo "Waiting for Android to finish booting..."
+          for i in {1..120}; do
+            if [[ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" == "1" ]]; then
+              echo "Android booted."
+              break
+            fi
+            sleep 5
+          done
+          [[ "$(adb shell getprop sys.boot_completed | tr -d '\r')" == "1" ]] || { tail -n 80 /tmp/emulator.log; exit 1; }
+
+          # Keep the screen on and unlocked.
+          adb shell svc power stayon true
+          adb shell settings put system screen_off_timeout 2147483647
+          adb shell input keyevent KEYCODE_WAKEUP
+          adb shell wm dismiss-keyguard || true
+          echo "started=true" >> "$GITHUB_OUTPUT"
+
+      - name: Expose ADB server to Tailscale
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # Your laptop uses this machine's ADB server (already authorized for
+          # the emulator). Allow ADB (5037) and the scrcpy tunnel (27183) only
+          # from Tailscale.
+          for p in 5037 27183; do
+            sudo iptables -I INPUT 1 -p tcp --dport "$p" -j DROP
+            sudo iptables -I INPUT 1 -p tcp --dport "$p" -i tailscale0 -j ACCEPT
+            sudo iptables -I INPUT 1 -p tcp --dport "$p" -i lo -j ACCEPT
+            sudo ip6tables -I INPUT 1 -p tcp --dport "$p" -j DROP
+            sudo ip6tables -I INPUT 1 -p tcp --dport "$p" -i tailscale0 -j ACCEPT
+            sudo ip6tables -I INPUT 1 -p tcp --dport "$p" -i lo -j ACCEPT
+          done
+
+          adb kill-server
+          nohup adb -a nodaemon server start > /tmp/adb-server.log 2>&1 &
+          disown
+          sleep 3
+          adb devices
+          timeout 3 bash -c "</dev/tcp/${TAILSCALE_IP}/5037" && echo "ADB server reachable on ${TAILSCALE_IP}:5037"
+
+      - name: Print connection details
+        shell: bash
+        run: |
+          echo "=========================================="
+          echo "ANDROID ${{ inputs.device }} (API ${{ inputs.api }}) READY"
+          echo "Tailscale IP: ${TAILSCALE_IP}"
+          echo "=========================================="
+          echo "On your laptop (needs adb + scrcpy):"
+          echo "  export ADB_SERVER_SOCKET=tcp:${TAILSCALE_IP}:5037"
+          echo "  scrcpy --tunnel-host=${TAILSCALE_IP} --tunnel-port=27183 --video-bit-rate=4M --max-fps=30"
+          echo ""
+          echo "End early with a backup:  adb shell touch /sdcard/END_SESSION"
+          echo "(run in the same terminal with ADB_SERVER_SOCKET set)"
+
+      - name: Keep device alive
+        shell: bash
+        run: |
+          # Stay up until 330 minutes after job start (20 min left for backup).
+          deadline=$(( JOB_START + 330 * 60 ))
+          while (( $(date +%s) < deadline )); do
+            if adb shell ls /sdcard/END_SESSION >/dev/null 2>&1; then
+              adb shell rm -f /sdcard/END_SESSION || true
+              echo "END_SESSION found. Starting backup."
+              exit 0
+            fi
+            if ! pgrep -f qemu-system >/dev/null; then
+              echo "Emulator stopped. Starting backup."
+              exit 0
+            fi
+            left=$(( (deadline - $(date +%s)) / 60 ))
+            echo "[$(date '+%H:%M:%S')] Android running — ${left} min left before backup"
+            sleep 60
+          done
+
+      - name: Stop emulator cleanly
+        if: always() && steps.emu.outputs.started == 'true'
+        shell: bash
+        run: |
+          adb emu kill 2>/dev/null || true
+          for i in {1..60}; do
+            pgrep -f "qemu-system" >/dev/null || break
+            sleep 2
+          done
+          pkill -f qemu-system 2>/dev/null || true
+
+      - name: Create encrypted backup
+        id: backup
+        if: always() && steps.emu.outputs.started == 'true'
+        shell: bash
+        env:
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          set -Eeuo pipefail
+          if [[ -z "$BACKUP_PASSPHRASE" ]]; then echo "Missing BACKUP_PASSPHRASE; refusing to upload an unencrypted backup."; exit 1; fi
+          cd "$ANDROID_AVD_HOME/$AVD_NAME.avd"
+          # User data only (apps, accounts, files); system image is re-downloaded.
+          files=()
+          for f in userdata-qemu.img userdata-qemu.img.qcow2 encryptionkey.img encryptionkey.img.qcow2; do
+            [[ -e "$f" ]] && files+=("$f")
+          done
+          (( ${#files[@]} )) || { echo "No device data found."; exit 1; }
+          mkdir -p /mnt/backup
+          tar -S -cf - "${files[@]}" | zstd -T0 -3 -q | \
+            gpg --batch --yes --pinentry-mode loopback \
+              --passphrase-fd 3 3<<<"$BACKUP_PASSPHRASE" \
+              --symmetric --cipher-algo AES256 --compress-algo none \
+              --output /mnt/backup/device.tar.zst.gpg
+          echo "Encrypted backup: $(du -h /mnt/backup/device.tar.zst.gpg | cut -f1)"
+
+      - name: Upload backup
+        if: always() && steps.backup.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.BACKUP_NAME }}
+          path: /mnt/backup/device.tar.zst.gpg
+          compression-level: 0
+          if-no-files-found: error
