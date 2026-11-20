@@ -1,19 +1,7 @@
-name: macOS Desktop + Tailscale + VNC
+name: macOS Desktop + Sunshine (Moonlight) + Tailscale
 
 on:
   workflow_dispatch:
-    inputs:
-      runner:
-        description: "macOS runner (try Intel if Apple Silicon shows a black screen)"
-        type: choice
-        default: macos-latest
-        options:
-          - macos-latest
-          - macos-15-intel
-      sunshine:
-        description: "Also start Sunshine (for Moonlight). Apple Silicon only."
-        type: boolean
-        default: true
 
 permissions:
   actions: read
@@ -21,7 +9,8 @@ permissions:
 
 jobs:
   macos-desktop:
-    runs-on: ${{ inputs.runner }}
+    # Sunshine is prebuilt only for Apple Silicon.
+    runs-on: macos-latest
     timeout-minutes: 350
 
     steps:
@@ -176,98 +165,8 @@ jobs:
           cat /tmp/macvnc.log
           exit 1
 
-      - name: Install and start RustDesk
-        id: rustdesk
-        continue-on-error: true
-        shell: bash
-        env:
-          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
-        run: |
-          set -Eeuo pipefail
-          # RustDesk streams the screen as compressed video (like RDP), so it
-          # copes with high latency much better than VNC. Connect directly to
-          # the Tailscale IP; no RustDesk servers are involved.
-          brew install --cask rustdesk
-          APP=/Applications/RustDesk.app/Contents/MacOS
-          RUNNER_UID=$(id -u runner)
-
-          # Privacy permissions: screen recording and input control.
-          TCC="/Library/Application Support/com.apple.TCC/TCC.db"
-          now=$(date +%s)
-          for svc in kTCCServiceScreenCapture kTCCServiceAccessibility kTCCServicePostEvent kTCCServiceListenEvent; do
-            sudo sqlite3 "$TCC" "INSERT OR REPLACE INTO access VALUES('$svc','com.carriez.rustdesk',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,$now,NULL,NULL,'UNUSED',$now);" \
-              || echo "TCC grant failed for $svc (continuing)"
-          done
-          sudo killall tccd 2>/dev/null || true
-
-          # Install RustDesk's root service and per-user agent (what its GUI
-          # installer does through a password prompt).
-          sudo tee /Library/LaunchDaemons/com.carriez.RustDesk_service.plist > /dev/null <<'EOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0"><dict>
-            <key>Label</key><string>com.carriez.RustDesk_service</string>
-            <key>AssociatedBundleIdentifiers</key><string>com.carriez.rustdesk</string>
-            <key>KeepAlive</key><true/>
-            <key>ThrottleInterval</key><integer>1</integer>
-            <key>ProgramArguments</key><array><string>/Applications/RustDesk.app/Contents/MacOS/service</string></array>
-            <key>RunAtLoad</key><true/>
-            <key>WorkingDirectory</key><string>/Applications/RustDesk.app/Contents/MacOS/</string>
-            <key>StandardErrorPath</key><string>/var/log/rustdesk_service.err</string>
-            <key>StandardOutPath</key><string>/var/log/rustdesk_service.out</string>
-          </dict></plist>
-          EOF
-          sudo tee /Library/LaunchAgents/com.carriez.RustDesk_server.plist > /dev/null <<'EOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0"><dict>
-            <key>Label</key><string>com.carriez.RustDesk_server</string>
-            <key>AssociatedBundleIdentifiers</key><string>com.carriez.rustdesk</string>
-            <key>LimitLoadToSessionType</key><array><string>LoginWindow</string><string>Aqua</string></array>
-            <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/><key>AfterInitialDemand</key><false/></dict>
-            <key>ThrottleInterval</key><integer>1</integer>
-            <key>RunAtLoad</key><true/>
-            <key>ProgramArguments</key><array><string>/Applications/RustDesk.app/Contents/MacOS/RustDesk</string><string>--server</string></array>
-            <key>WorkingDirectory</key><string>/Applications/RustDesk.app/Contents/MacOS/</string>
-            <key>ProcessType</key><string>Interactive</string>
-          </dict></plist>
-          EOF
-          sudo chown root:wheel /Library/LaunchDaemons/com.carriez.RustDesk_service.plist /Library/LaunchAgents/com.carriez.RustDesk_server.plist
-          sudo chmod 644 /Library/LaunchDaemons/com.carriez.RustDesk_service.plist /Library/LaunchAgents/com.carriez.RustDesk_server.plist
-
-          sudo launchctl bootstrap system /Library/LaunchDaemons/com.carriez.RustDesk_service.plist \
-            || sudo launchctl load -w /Library/LaunchDaemons/com.carriez.RustDesk_service.plist
-          sudo launchctl bootstrap "gui/${RUNNER_UID}" /Library/LaunchAgents/com.carriez.RustDesk_server.plist \
-            || sudo launchctl asuser "$RUNNER_UID" launchctl load -w /Library/LaunchAgents/com.carriez.RustDesk_server.plist
-          sleep 10
-
-          # Direct IP access on 21118 with a permanent password (= VNC_PASSWORD).
-          sudo "$APP/RustDesk" --option direct-server Y
-          sudo "$APP/RustDesk" --option direct-access-port 21118
-          sudo "$APP/RustDesk" --option verification-method use-permanent-password
-          sudo "$APP/RustDesk" --option approve-mode password
-          sudo "$APP/RustDesk" --password "$VNC_PASSWORD"
-
-          # Allow 21118 only from Tailscale addresses.
-          printf 'block in proto tcp from any to any port 21118\npass in proto tcp from 100.64.0.0/10 to any port 21118\n' | \
-            sudo pfctl -a com.apple/251.rustdesk-tailscale -f - 2>/dev/null
-
-          for i in {1..20}; do
-            if nc -z -G 3 "$TAILSCALE_IP" 21118 2>/dev/null; then
-              echo "RustDesk is reachable on ${TAILSCALE_IP}:21118"
-              echo "started=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            sleep 3
-          done
-          echo "RustDesk direct port did not open. Logs:"
-          sudo tail -n 50 /var/log/rustdesk_service.err /var/log/rustdesk_service.out 2>/dev/null || true
-          ls ~/Library/Logs/RustDesk 2>/dev/null && tail -n 50 ~/Library/Logs/RustDesk/server/*.log 2>/dev/null || true
-          exit 1
-
       - name: Install and start Sunshine (Moonlight)
         id: sunshine
-        if: inputs.sunshine && inputs.runner == 'macos-latest'
         continue-on-error: true
         shell: bash
         env:
@@ -277,6 +176,8 @@ jobs:
           # Sunshine streams the desktop as low-latency video for the Moonlight
           # client. Prebuilt only for Apple Silicon.
           brew tap LizardByte/homebrew
+          # New Homebrew refuses third-party taps until trusted.
+          brew trust lizardbyte/homebrew 2>/dev/null || brew trust --formula lizardbyte/homebrew/sunshine
           brew install sunshine
           SUN="$(brew --prefix)/bin/sunshine"
           CONF_DIR="$HOME/.config/sunshine"
@@ -353,16 +254,11 @@ jobs:
           echo "Admin user : rdpuser (password = VNC_PASSWORD) for admin prompts"
           echo "Password   : GitHub secret VNC_PASSWORD"
           echo "=========================================="
-          if [[ "${{ steps.rustdesk.outputs.started }}" == "true" ]]; then
-            echo "RustDesk   : ${TAILSCALE_IP}  (type the IP into RustDesk's ID box; password = VNC_PASSWORD)"
-          else
-            echo "RustDesk   : FAILED to start - use VNC below"
-          fi
           if [[ "${{ steps.sunshine.outputs.started }}" == "true" ]]; then
             echo "Moonlight  : Add PC manually -> ${TAILSCALE_IP}"
             echo "             Pair: enter the PIN at https://${TAILSCALE_IP}:47990 (user rdpuser, password = VNC_PASSWORD)"
           fi
-          echo "VNC (fallback): vncviewer -PreferredEncoding=Tight -AutoSelect=0 -QualityLevel=5 -CompressLevel=6 ${TAILSCALE_IP}:5900"
+          echo "VNC (fallback if Sunshine fails): vncviewer -PreferredEncoding=Tight -AutoSelect=0 -QualityLevel=5 -CompressLevel=6 ${TAILSCALE_IP}:5900"
           echo "To end early with a backup: create a file named END_SESSION on the Desktop."
           echo "Do NOT use Apple menu > Shut Down or Restart: it kills the job before the backup."
 
