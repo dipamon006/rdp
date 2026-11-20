@@ -11,10 +11,12 @@ on:
           - phone
           - tablet
       api:
-        description: "Android version (API level): 34 = Android 14, 35 = Android 15"
+        description: "Android version: 30 = Android 11 (fastest), 33 = 13, 34 = 14, 35 = 15"
         type: choice
-        default: "34"
+        default: "30"
         options:
+          - "30"
+          - "33"
           - "34"
           - "35"
 
@@ -102,10 +104,19 @@ jobs:
 
           echo no | avdmanager create avd -n "$AVD_NAME" -k "$IMAGE" -d "$profile" --force
 
-          # 8 GB data partition, hardware keyboard, 6 GB RAM.
+          # 8 GB data partition, hardware keyboard, 6 GB RAM, 4 cores.
+          # Lower resolution: with no GPU every pixel is drawn by the CPU, so
+          # 720p is several times faster than the profile's native 1080p+.
           CFG="$ANDROID_AVD_HOME/$AVD_NAME.avd/config.ini"
-          sed -i '/^disk.dataPartition.size=/d;/^hw.keyboard=/d;/^hw.ramSize=/d' "$CFG"
-          printf 'disk.dataPartition.size=8G\nhw.keyboard=yes\nhw.ramSize=6144\n' >> "$CFG"
+          if [[ "${{ inputs.device }}" == "tablet" ]]; then
+            W=1280; H=800; DPI=213
+          else
+            W=720; H=1520; DPI=320
+          fi
+          sed -i -E '/^(disk.dataPartition.size|hw.keyboard|hw.ramSize|hw.cpu.ncore|hw.lcd.width|hw.lcd.height|hw.lcd.density|hw.gpu.enabled|hw.gpu.mode)=/d' "$CFG"
+          printf '%s\n' "disk.dataPartition.size=8G" "hw.keyboard=yes" "hw.ramSize=6144" "hw.cpu.ncore=4" \
+            "hw.lcd.width=$W" "hw.lcd.height=$H" "hw.lcd.density=$DPI" \
+            "hw.gpu.enabled=yes" "hw.gpu.mode=swiftshader_indirect" >> "$CFG"
 
       - name: Find previous backup
         id: findbackup
@@ -179,6 +190,11 @@ jobs:
           done
           [[ "$(adb shell getprop sys.boot_completed | tr -d '\r')" == "1" ]] || { tail -n 80 /tmp/emulator.log; exit 1; }
 
+          # No animations: much smoother with software rendering.
+          adb shell settings put global window_animation_scale 0
+          adb shell settings put global transition_animation_scale 0
+          adb shell settings put global animator_duration_scale 0
+
           # Keep the screen on and unlocked.
           adb shell svc power stayon true
           adb shell settings put system screen_off_timeout 2147483647
@@ -218,7 +234,7 @@ jobs:
           echo "=========================================="
           echo "On your laptop (needs adb + scrcpy):"
           echo "  export ADB_SERVER_SOCKET=tcp:${TAILSCALE_IP}:5037"
-          echo "  scrcpy --tunnel-host=${TAILSCALE_IP} --tunnel-port=27183 --video-bit-rate=4M --max-fps=30"
+          echo "  scrcpy --tunnel-host=${TAILSCALE_IP} --tunnel-port=27183 --video-codec=h264 --video-bit-rate=2M --max-fps=30 --max-size=1280"
           echo ""
           echo "End early with a backup:  adb shell touch /sdcard/END_SESSION"
           echo "(run in the same terminal with ADB_SERVER_SOCKET set)"
