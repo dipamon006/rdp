@@ -2,6 +2,14 @@ name: macOS Desktop + Tailscale + VNC
 
 on:
   workflow_dispatch:
+    inputs:
+      runner:
+        description: "macOS runner (try Intel if Apple Silicon shows a black screen)"
+        type: choice
+        default: macos-latest
+        options:
+          - macos-latest
+          - macos-15-intel
 
 permissions:
   actions: read
@@ -9,7 +17,7 @@ permissions:
 
 jobs:
   macos-desktop:
-    runs-on: macos-latest
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 350
 
     steps:
@@ -115,6 +123,26 @@ jobs:
             sudo tee /Library/Preferences/com.apple.VNCSettings.txt > /dev/null
           sudo chmod 600 /Library/Preferences/com.apple.VNCSettings.txt
 
+          # Grant Screen Sharing the privacy permissions it needs to capture the
+          # screen and send input. Without these the viewer shows a black screen.
+          # (GitHub's macOS images allow editing the system TCC database.)
+          TCC="/Library/Application Support/com.apple.TCC/TCC.db"
+          now=$(date +%s)
+          grant() { # service client client_type(0=bundle id,1=path)
+            sudo sqlite3 "$TCC" "INSERT OR REPLACE INTO access VALUES('$1','$2',$3,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,$now,NULL,NULL,'UNUSED',$now);" \
+              || echo "TCC grant failed: $1 $2"
+          }
+          for svc in kTCCServiceScreenCapture kTCCServicePostEvent kTCCServiceAccessibility; do
+            grant "$svc" com.apple.screensharing.agent 0
+            grant "$svc" com.apple.RemoteDesktopAgent 0
+            grant "$svc" /System/Library/CoreServices/RemoteManagement/screensharingd.bundle/Contents/MacOS/screensharingd 1
+            grant "$svc" /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent 1
+          done
+          sudo killall tccd 2>/dev/null || true
+
+          # Wake the display.
+          caffeinate -u -t 10 &
+
           sudo "$KS" -configure -allowAccessFor -allUsers -privs -all
           sudo "$KS" -configure -clientopts -setvnclegacy -vnclegacy yes
           sudo "$KS" -activate -restart -agent -console
@@ -130,6 +158,23 @@ jobs:
           echo "Screen Sharing did not start."
           sudo lsof -nP -iTCP:5900 -sTCP:LISTEN || true
           exit 1
+
+      - name: Diagnostic screenshot
+        continue-on-error: true
+        shell: bash
+        run: |
+          sleep 10
+          system_profiler SPDisplaysDataType | sed -n '1,30p' || true
+          screencapture -x /tmp/screen.png && ls -la /tmp/screen.png
+
+      - name: Upload diagnostic screenshot
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-screen-${{ github.run_id }}
+          path: /tmp/screen.png
+          retention-days: 1
+          if-no-files-found: ignore
 
       - name: Print connection details
         shell: bash
