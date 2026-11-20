@@ -102,50 +102,59 @@ jobs:
           echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
           echo "Tailscale IP: $TS_IP"
 
-      - name: Enable Screen Sharing (VNC)
+      - name: Build macVNC server
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # Apple's Screen Sharing needs MDM to capture the screen on new macOS.
+          # macVNC (open source, ScreenCaptureKit) started from this job inherits
+          # the runner's screen-recording permission instead.
+          brew install libvncserver
+          git clone --depth 1 https://github.com/LibVNC/macVNC.git /tmp/macVNC
+          cmake -S /tmp/macVNC -B /tmp/macVNC/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/macVNC/build --config Release
+          BIN=$(find /tmp/macVNC/build -path '*macVNC.app/Contents/MacOS/macVNC' -type f | head -n1)
+          [[ -x "$BIN" ]] || { echo "macVNC build not found"; exit 1; }
+          echo "MACVNC_BIN=$BIN" >> "$GITHUB_ENV"
+
+      - name: Start VNC server
         id: vnc
         shell: bash
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
           set -Eeuo pipefail
-          KS=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
 
           # Allow VNC on port 5900 only from Tailscale addresses.
           printf 'block in proto tcp from any to any port 5900\npass in proto tcp from 100.64.0.0/10 to any port 5900\n' | \
             sudo pfctl -a com.apple/250.vnc-tailscale -f - 2>/dev/null
           sudo pfctl -E 2>/dev/null || true
 
-          # Legacy VNC password (VNC uses only the first 8 characters).
-          printf '%s' "$VNC_PASSWORD" | perl -we 'BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E0" }
-            $_ = <>; chomp; s/^(.{8}).*/$1/; @p = unpack "C*", $_;
-            foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) } print "\n"' | \
-            sudo tee /Library/Preferences/com.apple.VNCSettings.txt > /dev/null
-          sudo chmod 600 /Library/Preferences/com.apple.VNCSettings.txt
-
-          # Grant Screen Sharing the privacy permissions it needs to capture the
-          # screen and send input. Without these the viewer shows a black screen.
-          # (GitHub's macOS images allow editing the system TCC database.)
+          # Best effort: grant macVNC screen recording and input control.
           TCC="/Library/Application Support/com.apple.TCC/TCC.db"
           now=$(date +%s)
-          grant() { # service client client_type(0=bundle id,1=path)
-            sudo sqlite3 "$TCC" "INSERT OR REPLACE INTO access VALUES('$1','$2',$3,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,$now,NULL,NULL,'UNUSED',$now);" \
-              || echo "TCC grant failed: $1 $2"
-          }
-          for svc in kTCCServiceScreenCapture kTCCServicePostEvent kTCCServiceAccessibility; do
-            grant "$svc" com.apple.screensharing.agent 0
-            grant "$svc" com.apple.RemoteDesktopAgent 0
-            grant "$svc" /System/Library/CoreServices/RemoteManagement/screensharingd.bundle/Contents/MacOS/screensharingd 1
-            grant "$svc" /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent 1
+          for svc in kTCCServiceScreenCapture kTCCServiceAccessibility kTCCServicePostEvent; do
+            sudo sqlite3 "$TCC" "INSERT OR REPLACE INTO access VALUES('$svc','$MACVNC_BIN',1,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,$now,NULL,NULL,'UNUSED',$now);" \
+              || echo "TCC grant failed for $svc (continuing)"
           done
-          sudo killall tccd 2>/dev/null || true
 
-          # Wake the display.
           caffeinate -u -t 10 &
 
-          sudo "$KS" -configure -allowAccessFor -allUsers -privs -all
-          sudo "$KS" -configure -clientopts -setvnclegacy -vnclegacy yes
-          sudo "$KS" -activate -restart -agent -console
+          start_vnc() {
+            nohup "$MACVNC_BIN" -rfbport 5900 -passwd "$VNC_PASSWORD" "$@" \
+              > /tmp/macvnc.log 2>&1 &
+            disown
+          }
+
+          start_vnc
+          sleep 5
+          if ! pgrep -f "$MACVNC_BIN" >/dev/null; then
+            echo "macVNC exited (likely no input permission). Log:"
+            cat /tmp/macvnc.log
+            echo "Retrying in view-only mode (screen visible, no mouse/keyboard)."
+            start_vnc -viewonly
+            sleep 5
+          fi
 
           for i in {1..20}; do
             if nc -z -G 3 "$TAILSCALE_IP" 5900 2>/dev/null; then
@@ -155,8 +164,8 @@ jobs:
             fi
             sleep 3
           done
-          echo "Screen Sharing did not start."
-          sudo lsof -nP -iTCP:5900 -sTCP:LISTEN || true
+          echo "macVNC did not start. Log:"
+          cat /tmp/macvnc.log
           exit 1
 
       - name: Diagnostic screenshot
