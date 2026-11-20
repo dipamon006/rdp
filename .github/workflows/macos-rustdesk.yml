@@ -1,4 +1,4 @@
-name: macOS Desktop + Tailscale + VNC
+name: macOS Desktop + RustDesk + Tailscale
 
 on:
   workflow_dispatch:
@@ -45,14 +45,6 @@ jobs:
           sudo pmset -a sleep 0 displaysleep 0 disksleep 0
           defaults -currentHost write com.apple.screensaver idleTime 0
           defaults write com.apple.screensaver askForPassword -int 0
-
-          # Less to redraw and send over VNC: no transparency, no animations.
-          defaults write com.apple.universalaccess reduceTransparency -bool true || true
-          defaults write com.apple.universalaccess reduceMotion -bool true || true
-          defaults write com.apple.dock autohide-time-modifier -float 0 || true
-          defaults write com.apple.dock launchanim -bool false || true
-          defaults write NSGlobalDomain NSAutomaticWindowAnimationsEnabled -bool false || true
-          killall Dock 2>/dev/null || true
           sudo defaults write /Library/Preferences/com.apple.screensaver loginWindowIdleTime 0
 
       - name: Find previous backup
@@ -250,7 +242,15 @@ jobs:
           sudo "$APP/RustDesk" --option direct-access-port 21118
           sudo "$APP/RustDesk" --option verification-method use-permanent-password
           sudo "$APP/RustDesk" --option approve-mode password
-          sudo "$APP/RustDesk" --password "$VNC_PASSWORD"
+          # The daemon can reject this until it has fully started; retry.
+          ok=""
+          for i in {1..20}; do
+            out=$(sudo "$APP/RustDesk" --password "$VNC_PASSWORD" 2>&1 || true)
+            echo "$out"
+            if grep -q 'Done' <<<"$out"; then ok=1; break; fi
+            sleep 3
+          done
+          [[ -n "$ok" ]] || { echo "Could not set RustDesk password."; exit 1; }
 
           # Allow 21118 only from Tailscale addresses.
           printf 'block in proto tcp from any to any port 21118\npass in proto tcp from 100.64.0.0/10 to any port 21118\n' | \
