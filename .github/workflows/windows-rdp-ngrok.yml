@@ -1,0 +1,305 @@
+name: Windows Desktop + ngrok + RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      desktop:
+        description: "Desktop shell: WinRust (lighter Rust taskbar/file manager, beta) or stock Windows"
+        type: choice
+        default: winrust
+        options:
+          - winrust
+          - stock
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  windows-desktop:
+    runs-on: windows-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Record job start time
+        shell: pwsh
+        run: |
+          "JOB_START=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Create user and enable RDP
+        shell: pwsh
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:VNC_PASSWORD) { throw "Missing VNC_PASSWORD secret." }
+          # RDP is reachable from the internet through ngrok: bots will guess passwords.
+          if ($env:VNC_PASSWORD.Length -lt 12) {
+            throw "VNC_PASSWORD must be at least 12 characters for internet-facing RDP. Use a long random one."
+          }
+
+          # Accept the same (possibly short/simple) password as the VNC desktop:
+          # turn off Windows password complexity and minimum length.
+          secedit /export /cfg C:\pw.inf /areas SECURITYPOLICY | Out-Null
+          (Get-Content C:\pw.inf) -replace '^PasswordComplexity\s*=.*', 'PasswordComplexity = 0' `
+            -replace '^MinimumPasswordLength\s*=.*', 'MinimumPasswordLength = 0' |
+            Set-Content C:\pw.inf -Encoding Unicode
+          secedit /configure /db C:\Windows\security\local.sdb /cfg C:\pw.inf /areas SECURITYPOLICY /quiet
+          Remove-Item C:\pw.inf
+
+          $pw = ConvertTo-SecureString $env:VNC_PASSWORD -AsPlainText -Force
+          if (-not (Get-LocalUser -Name rdpuser -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name rdpuser -Password $pw -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          }
+          Add-LocalGroupMember -Group Administrators -Member rdpuser -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member rdpuser -ErrorAction SilentlyContinue
+
+          # Enable RDP with Network Level Authentication.
+          $ts = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          Set-ItemProperty -Path $ts -Name fDenyTSConnections -Value 0
+          Set-ItemProperty -Path "$ts\WinStations\RDP-Tcp" -Name UserAuthentication -Value 1
+
+          # No inbound RDP from the network at all: ngrok reaches RDP locally
+          # (127.0.0.1), so the built-in RDP firewall rules stay disabled.
+          Disable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+
+          # Lock the account for 15 min after 5 wrong passwords (slows guessing).
+          net accounts /lockoutthreshold:5 /lockoutwindow:15 /lockoutduration:15 | Out-Null
+
+          # Create the profile folder now (Win32 CreateProfile) so a backup can be
+          # restored into it before the first login.
+          Add-Type -TypeDefinition @"
+          using System; using System.Runtime.InteropServices; using System.Text;
+          public static class UserProfileApi {
+            [DllImport("userenv.dll", CharSet = CharSet.Unicode)]
+            public static extern int CreateProfile(string sid, string user, StringBuilder path, uint len);
+          }
+          "@
+          $sid = (Get-LocalUser -Name rdpuser).SID.Value
+          $sb = New-Object System.Text.StringBuilder 260
+          $hr = [UserProfileApi]::CreateProfile($sid, 'rdpuser', $sb, 260)
+          # 0x800700B7 = profile already exists.
+          if ($hr -ne 0 -and $hr -ne -2147024713) { throw ("CreateProfile failed: 0x{0:X8}" -f $hr) }
+          $prof = (Get-CimInstance Win32_UserProfile | Where-Object { $_.SID -eq $sid }).LocalPath
+          if (-not $prof) { throw "rdpuser profile was not created." }
+          "RDP_PROFILE=$prof" | Out-File -Append $env:GITHUB_ENV
+          Write-Host "Profile: $prof"
+
+      - name: Block shutdown and restart for users
+        shell: pwsh
+        run: |
+          # Shutting down the runner kills the job before the backup runs.
+          # Remove the shutdown privilege; use Sign out to end a session.
+          secedit /export /cfg C:\sec.inf /areas USER_RIGHTS | Out-Null
+          $cfg = Get-Content C:\sec.inf
+          $cfg = $cfg | Where-Object { $_ -notmatch '^(SeShutdownPrivilege|SeRemoteShutdownPrivilege)\s*=' }
+          $cfg = $cfg -replace '^\[Privilege Rights\]$', "[Privilege Rights]`r`nSeShutdownPrivilege = *S-1-5-18`r`nSeRemoteShutdownPrivilege = *S-1-5-18"
+          $cfg | Set-Content C:\sec.inf -Encoding Unicode
+          secedit /configure /db C:\Windows\security\local.sdb /cfg C:\sec.inf /areas USER_RIGHTS /quiet
+          Remove-Item C:\sec.inf
+
+      - name: Find previous backup
+        id: findbackup
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_id=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=windows-home-backup&per_page=20" \
+            --jq '[.artifacts[] | select(.expired == false)][0].workflow_run.id // empty')
+          echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
+          if [[ -n "$run_id" ]]; then echo "Found backup from run ${run_id}"; else echo "No previous backup."; fi
+
+      - name: Download previous backup
+        if: steps.findbackup.outputs.run_id != ''
+        uses: actions/download-artifact@v5
+        with:
+          name: windows-home-backup
+          run-id: ${{ steps.findbackup.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: C:\restore
+
+      - name: Restore user folders
+        if: steps.findbackup.outputs.run_id != ''
+        shell: pwsh
+        env:
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:BACKUP_PASSPHRASE) { throw "Missing BACKUP_PASSPHRASE; cannot decrypt backup." }
+          & 'C:\Program Files\7-Zip\7z.exe' x 'C:\restore\home.7z' "-p$env:BACKUP_PASSPHRASE" "-o$env:RDP_PROFILE" -aoa -bso0 -bsp0
+          if ($LASTEXITCODE -ne 0) { throw "7-Zip restore failed ($LASTEXITCODE)." }
+          icacls $env:RDP_PROFILE /setowner rdpuser /T /C /Q | Out-Null
+          icacls $env:RDP_PROFILE /grant 'rdpuser:(OI)(CI)F' /T /C /Q | Out-Null
+          Remove-Item C:\restore -Recurse -Force
+          Write-Host "User folders restored."
+
+      - name: Prepare WinRust (installs at first RDP login)
+        if: inputs.desktop == 'winrust'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # WinRust (github.com/Lemxy/WinRust, beta): Rust replacements for the
+          # taskbar, File Explorer, search and Task Manager. It applies per-user
+          # settings to whoever runs explorer.exe in the session, so it must
+          # install inside rdpuser's session: a one-time task at rdpuser's logon.
+          $ver = 'v0.5.1'
+          New-Item -ItemType Directory -Force C:\WinRust | Out-Null
+          Invoke-WebRequest "https://github.com/Lemxy/WinRust/releases/download/$ver/WinRust.exe" -OutFile C:\WinRust\WinRust.exe
+          Unblock-File C:\WinRust\WinRust.exe
+
+          $cmd = 'Start-Sleep 20; ' +
+                 '& C:\WinRust\WinRust.exe install all rust-explorer --yes *> C:\WinRust\install.log; ' +
+                 '"exit code: $LASTEXITCODE" | Add-Content C:\WinRust\install.log; ' +
+                 'Unregister-ScheduledTask -TaskName WinRustFirstLogon -Confirm:$false'
+          # Encoded so the quotes inside the command survive the task's command line.
+          $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
+          $action    = New-ScheduledTaskAction -Execute 'powershell.exe' `
+                         -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $enc"
+          $trigger   = New-ScheduledTaskTrigger -AtLogOn -User rdpuser
+          $principal = New-ScheduledTaskPrincipal -UserId rdpuser -LogonType Interactive -RunLevel Highest
+          Register-ScheduledTask -TaskName WinRustFirstLogon -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+          Write-Host "WinRust $ver will install about 20 s after rdpuser's first RDP login."
+
+      - name: Install and start ngrok
+        shell: pwsh
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:NGROK_AUTHTOKEN) { throw "Missing NGROK_AUTHTOKEN secret (dashboard.ngrok.com > Your Authtoken)." }
+
+          $dir = 'C:\ngrok'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Invoke-WebRequest 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip' -OutFile "$dir\ngrok.zip"
+          Expand-Archive "$dir\ngrok.zip" -DestinationPath $dir -Force
+          $ngrok = "$dir\ngrok.exe"
+
+          # Tunnel definition; ngrok runs as a Windows service so it survives this step.
+          @"
+          version: "2"
+          authtoken: $($env:NGROK_AUTHTOKEN)
+          tunnels:
+            rdp:
+              proto: tcp
+              addr: 127.0.0.1:3389
+          "@ | Set-Content "$dir\ngrok.yml" -Encoding ascii
+          & $ngrok config check --config "$dir\ngrok.yml"
+          & $ngrok service install --config "$dir\ngrok.yml"
+          & $ngrok service start
+
+          # Read the public address from ngrok's local API.
+          $addr = $null
+          for ($i = 0; $i -lt 30 -and -not $addr; $i++) {
+            Start-Sleep 2
+            try {
+              $t = (Invoke-RestMethod http://127.0.0.1:4040/api/tunnels).tunnels |
+                   Where-Object { $_.public_url -like 'tcp://*' } | Select-Object -First 1
+              if ($t) { $addr = $t.public_url -replace '^tcp://', '' }
+            } catch {}
+          }
+          if (-not $addr) { throw "ngrok did not open a tunnel. Is the card verified on your ngrok account? (needed for TCP)" }
+          "RDP_ADDR=$addr" | Out-File -Append $env:GITHUB_ENV
+          Write-Host "RDP address: $addr"
+
+      - name: Verify RDP listener
+        id: rdp
+        shell: pwsh
+        run: |
+          for ($i = 0; $i -lt 20; $i++) {
+            if (Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -InformationLevel Quiet -WarningAction SilentlyContinue) {
+              Write-Host "RDP is listening; public address $($env:RDP_ADDR)"
+              "started=true" | Out-File -Append $env:GITHUB_OUTPUT
+              exit 0
+            }
+            Start-Sleep 3
+          }
+          throw "RDP did not start."
+
+      - name: Print connection details
+        shell: pwsh
+        run: |
+          Write-Host "=========================================="
+          Write-Host "WINDOWS DESKTOP READY"
+          Write-Host "RDP server : $($env:RDP_ADDR)"
+          Write-Host "User       : rdpuser"
+          Write-Host "Password   : GitHub secret VNC_PASSWORD"
+          Write-Host "=========================================="
+          Write-Host "Remmina: new RDP connection, server $($env:RDP_ADDR), user rdpuser"
+          Write-Host "Linux:   KRB5_CONFIG=/dev/null xfreerdp3 /v:$($env:RDP_ADDR) /u:rdpuser /d:. /sec:nla /cert:ignore /dynamic-resolution +clipboard"
+          Write-Host "This address is public: 5 wrong passwords lock the account for 15 minutes."
+          Write-Host "End the session with Start > rdpuser > Sign out (not Shut down)."
+          if ('${{ inputs.desktop }}' -eq 'winrust') {
+            Write-Host "WinRust: installs ~20 s after your first login (screen may flicker as the taskbar swaps)."
+            Write-Host "  Search: Alt+Space   Files: Win+E   Task Manager: Ctrl+Shift+Esc"
+            Write-Host "  If the screen loses its taskbar: Ctrl+Alt+End > Task Manager > Run: explorer.exe"
+          }
+
+      - name: Keep desktop alive
+        shell: pwsh
+        run: |
+          # Stay up until 330 minutes after job start (20 min left for backup).
+          # Signing out ends the session early and goes straight to backup.
+          # Closing the RDP window only disconnects; the session keeps running.
+          $deadline = [int64]$env:JOB_START + 330 * 60
+          $seen = $false
+          $gone = 0
+          $shownLog = $false
+          while ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -lt $deadline) {
+            $sessions = (quser 2>$null) | Select-String -Pattern '\brdpuser\b'
+            if (-not $shownLog -and (Test-Path C:\WinRust\install.log) -and (Select-String -Path C:\WinRust\install.log -Pattern 'exit code' -Quiet)) {
+              Write-Host "---- WinRust install log ----"; Get-Content C:\WinRust\install.log | Write-Host; $shownLog = $true
+            }
+            if ($sessions) { $seen = $true; $gone = 0 }
+            elseif ($seen) {
+              $gone++
+              if ($gone -ge 2) { Write-Host "rdpuser signed out. Starting backup."; exit 0 }
+            }
+            $left = [math]::Floor(($deadline - [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) / 60)
+            $state = if ($sessions) { 'session active' } elseif ($seen) { 'signed out?' } else { 'waiting for first login' }
+            Write-Host "[$(Get-Date -Format HH:mm:ss)] $state - $left min left before backup"
+            Start-Sleep 60
+          }
+          exit 0
+
+      - name: Sign out user before backup
+        if: always() && steps.rdp.outputs.started == 'true'
+        shell: pwsh
+        run: |
+          $lines = (quser 2>$null) | Select-String -Pattern '\brdpuser\b'
+          foreach ($l in $lines) {
+            $id = ($l.ToString().Trim() -split '\s+') | Where-Object { $_ -match '^\d+$' } | Select-Object -First 1
+            if ($id) { logoff $id }
+          }
+          Start-Sleep 10
+
+      - name: Create encrypted backup
+        id: backup
+        if: always() && steps.rdp.outputs.started == 'true'
+        shell: pwsh
+        env:
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:BACKUP_PASSPHRASE) { throw "Missing BACKUP_PASSPHRASE; refusing to upload an unencrypted backup." }
+          New-Item -ItemType Directory -Force C:\backup | Out-Null
+
+          # User folders only. AppData and installed programs are not kept.
+          $folders = 'Desktop','Documents','Downloads','Pictures','Videos','Music' |
+            Where-Object { Test-Path (Join-Path $env:RDP_PROFILE $_) }
+          if (-not $folders) { Write-Host "Nothing to back up."; exit 0 }
+
+          Push-Location $env:RDP_PROFILE
+          & 'C:\Program Files\7-Zip\7z.exe' a -t7z -mhe=on "-p$env:BACKUP_PASSPHRASE" C:\backup\home.7z @folders -bso0 -bsp0
+          $code = $LASTEXITCODE
+          Pop-Location
+          # 7-Zip exit code 1 = warnings (e.g. a locked file skipped); still usable.
+          if ($code -gt 1) { throw "7-Zip backup failed ($code)." }
+          Write-Host "Encrypted backup ready: $((Get-Item C:\backup\home.7z).Length / 1MB) MB"
+
+      - name: Upload backup
+        if: always() && steps.backup.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-home-backup
+          path: C:\backup\home.7z
+          if-no-files-found: warn
