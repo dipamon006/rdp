@@ -1,0 +1,475 @@
+name: GNOME Desktop + Azure relay (frp) + RDP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  gnome-desktop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Record job start time
+        shell: bash
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Remove snap completely
+        shell: bash
+        run: |
+          sudo systemctl stop snapd 2>/dev/null || true
+          sudo systemctl disable snapd 2>/dev/null || true
+          sudo apt-get purge -y snapd 2>/dev/null || true
+          sudo rm -rf /snap /var/snap /var/lib/snapd /root/snap
+          printf 'Package: snapd\nPin: release a=*\nPin-Priority: -10\n' | \
+            sudo tee /etc/apt/preferences.d/no-snap > /dev/null
+
+      - name: Restore apt package cache
+        id: aptcache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/apt-debs
+          key: apt-debs-gnome-rdp-v2
+
+      - name: Install GNOME + Remote Desktop + Chromium (no snap)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          # Retry stalled downloads instead of hanging; keep .deb files for the cache.
+          printf 'Acquire::Retries "5";\nAcquire::http::Timeout "15";\nAPT::Keep-Downloaded-Packages "true";\n' | \
+            sudo tee /etc/apt/apt.conf.d/99-fast > /dev/null
+          sudo rm -f /etc/apt/apt.conf.d/docker-clean
+
+          # Reuse .deb files from previous runs.
+          if [[ -d ~/apt-debs ]]; then
+            sudo cp -n ~/apt-debs/*.deb /var/cache/apt/archives/ 2>/dev/null || true
+            echo "Restored $(ls ~/apt-debs | wc -l) cached packages."
+          fi
+
+          # Skip slow man-page index rebuilds and docs during install.
+          echo 'man-db man-db/auto-update boolean false' | sudo debconf-set-selections
+          sudo rm -f /var/lib/man-db/auto-update
+          printf 'path-exclude /usr/share/doc/*\npath-exclude /usr/share/man/*\npath-exclude /usr/share/info/*\n' | \
+            sudo tee /etc/dpkg/dpkg.cfg.d/01-nodoc > /dev/null
+
+          # Add the Chromium PPA first so one update covers everything.
+          sudo add-apt-repository -y --no-update ppa:xtradeb/apps
+          sudo apt-get update -qq
+
+          PKGS=(
+            gnome-session gnome-shell ubuntu-session gnome-settings-daemon
+            gnome-control-center gnome-terminal nautilus gnome-text-editor
+            eog file-roller gnome-tweaks
+            gnome-shell-extension-ubuntu-dock gnome-shell-extension-appindicator
+            yaru-theme-gnome-shell yaru-theme-gtk yaru-theme-icon fonts-ubuntu
+            libgl1-mesa-dri xdg-desktop-portal-gnome dconf-cli
+            dbus-user-session dbus-x11 at-spi2-core x11-xserver-utils
+            gnome-remote-desktop pipewire wireplumber fuse3 openssl
+            curl wget git unzip net-tools htop gnupg
+            chromium
+          )
+
+          # apt downloads one file at a time; the mirror is slow per connection.
+          # Fetch all .deb files in parallel with aria2, then let apt install them.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends aria2
+          sudo apt-get install -qq --print-uris -y --no-install-recommends "${PKGS[@]}" | \
+            awk -F"'" '/^'"'"'http/ { split($3, a, " "); printf "%s\n  out=%s\n", $2, a[1] }' \
+            > /tmp/apt-uris.txt
+          echo "Downloading $(grep -c '^http' /tmp/apt-uris.txt || true) packages in parallel..."
+          if [[ -s /tmp/apt-uris.txt ]]; then
+            sudo aria2c -i /tmp/apt-uris.txt -d /var/cache/apt/archives \
+              -j 16 -x 4 -s 4 --max-tries=5 --retry-wait=2 --timeout=20 \
+              --auto-file-renaming=false --allow-overwrite=true \
+              --console-log-level=warn --summary-interval=0 || \
+              echo "Some parallel downloads failed; apt will fetch the rest."
+          fi
+
+          # apt checks every file's hash and downloads anything still missing.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${PKGS[@]}"
+
+          mkdir -p ~/apt-debs
+          cp -n /var/cache/apt/archives/*.deb ~/apt-debs/ 2>/dev/null || true
+
+      - name: Save apt package cache
+        if: steps.aptcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/apt-debs
+          key: apt-debs-gnome-rdp-v2
+
+      - name: Create user
+        shell: bash
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+          if [[ -z "$VNC_PASSWORD" ]]; then echo "Missing VNC_PASSWORD secret."; exit 1; fi
+          # The relay can expose RDP publicly (--public mode): bots will guess passwords.
+          if (( ${#VNC_PASSWORD} < 12 )); then
+            echo "VNC_PASSWORD must be at least 12 characters for internet-facing RDP."; exit 1
+          fi
+          sudo useradd -m -s /bin/bash -U rdpuser || true
+          echo "rdpuser:${VNC_PASSWORD}" | sudo chpasswd
+          sudo usermod -aG sudo rdpuser
+          echo "rdpuser ALL=(ALL) NOPASSWD:ALL" | \
+            sudo tee /etc/sudoers.d/rdpuser-nopasswd > /dev/null
+          sudo chown -R rdpuser:rdpuser /home/rdpuser
+
+      - name: Restore encrypted home backup
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          set -Eeuo pipefail
+
+          url=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=desktop-home-backup&per_page=20" \
+            --jq '[.artifacts[] | select(.expired == false)][0].archive_download_url // empty')
+
+          if [[ -z "$url" ]]; then
+            echo "No previous backup found. Starting with a fresh home."
+            exit 0
+          fi
+          if [[ -z "$BACKUP_PASSPHRASE" ]]; then
+            echo "Missing BACKUP_PASSPHRASE; cannot decrypt backup."
+            exit 1
+          fi
+
+          mkdir -p /tmp/restore
+          gh api "$url" > /tmp/restore/backup.zip
+          unzip -o -q /tmp/restore/backup.zip -d /tmp/restore
+
+          printf '%s' "$BACKUP_PASSPHRASE" | \
+            gpg --batch --yes --pinentry-mode loopback \
+              --passphrase-fd 0 \
+              --decrypt --output /tmp/restore/home.tar.gz \
+              /tmp/restore/home.tar.gz.gpg
+
+          sudo tar -xzf /tmp/restore/home.tar.gz -C /home/rdpuser
+          sudo chown -R rdpuser:rdpuser /home/rdpuser
+          rm -rf /tmp/restore
+          echo "Home restored from previous backup."
+
+      - name: Connect to Azure relay (frp)
+        shell: bash
+        env:
+          FRP_SERVER: ${{ secrets.FRP_SERVER }}
+          FRP_TOKEN: ${{ secrets.FRP_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          if [[ -z "$FRP_SERVER" || -z "$FRP_TOKEN" ]]; then
+            echo "Missing FRP_SERVER / FRP_TOKEN secrets."; exit 1
+          fi
+
+          # frpc connects OUT to frps on your Azure VM and forwards local RDP
+          # (127.0.0.1:3389) to port 13390 on the VM.
+          VER=0.72.0
+          curl -fsSL -o /tmp/frp.tgz \
+            "https://github.com/fatedier/frp/releases/download/v${VER}/frp_${VER}_linux_amd64.tar.gz"
+          tar -xzf /tmp/frp.tgz -C /tmp
+          sudo install -m 755 "/tmp/frp_${VER}_linux_amd64/frpc" /usr/local/bin/frpc
+
+          sudo mkdir -p /etc/frp
+          sudo tee /etc/frp/frpc.toml > /dev/null <<EOF
+          serverAddr = "${FRP_SERVER}"
+          serverPort = 47391
+          loginFailExit = false
+          auth.method = "token"
+          auth.token = "${FRP_TOKEN}"
+          transport.tls.enable = true
+          log.to = "/var/log/frpc.log"
+
+          [[proxies]]
+          name = "rdp-gnome"
+          type = "tcp"
+          localIP = "127.0.0.1"
+          localPort = 3389
+          remotePort = 13390
+          EOF
+          sudo chmod 600 /etc/frp/frpc.toml
+          sudo frpc verify -c /etc/frp/frpc.toml
+
+          sudo tee /etc/systemd/system/frpc.service > /dev/null <<'EOF'
+          [Unit]
+          Description=frp client (RDP to Azure relay)
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          ExecStart=/usr/local/bin/frpc -c /etc/frp/frpc.toml
+          Restart=always
+          RestartSec=3
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now frpc
+
+          for i in {1..30}; do
+            if sudo grep -q 'start proxy success' /var/log/frpc.log 2>/dev/null; then
+              echo "Relay connected: GNOME RDP is on ${FRP_SERVER} port 13390."
+              exit 0
+            fi
+            sleep 2
+          done
+          sudo tail -n 30 /var/log/frpc.log || true
+          echo "Could not connect to the relay. Check frps is running and Azure allows TCP 47391."
+          exit 1
+
+      - name: Configure GNOME + Remote Desktop
+        shell: bash
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "$VNC_PASSWORD" ]]; then
+            echo "Missing VNC_PASSWORD secret."
+            exit 1
+          fi
+
+          # Runner image sets XDG_CONFIG_HOME=/home/runner/.config in
+          # /etc/environment. PAM would pass it to rdpuser, who cannot read it.
+          sudo sed -i '/^XDG_CONFIG_HOME=/d;/^XDG_CACHE_HOME=/d;/^XDG_DATA_HOME=/d' /etc/environment
+
+          # System-wide GNOME defaults: no lock screen, no idle blank,
+          # no animations (smoother over RDP).
+          sudo mkdir -p /etc/dconf/profile /etc/dconf/db/local.d
+          printf 'user-db:user\nsystem-db:local\n' | sudo tee /etc/dconf/profile/user > /dev/null
+          sudo tee /etc/dconf/db/local.d/00-vnc > /dev/null <<'EOF'
+          [org/gnome/desktop/screensaver]
+          lock-enabled=false
+          idle-activation-enabled=false
+
+          [org/gnome/desktop/session]
+          idle-delay=uint32 0
+
+          [org/gnome/desktop/lockdown]
+          disable-lock-screen=true
+
+          [org/gnome/desktop/interface]
+          enable-animations=false
+          color-scheme='prefer-dark'
+          gtk-theme='Yaru-dark'
+          icon-theme='Yaru'
+
+          [org/gnome/settings-daemon/plugins/power]
+          sleep-inactive-ac-type='nothing'
+          EOF
+          sudo dconf update
+
+          # Block power off / reboot / suspend from the desktop. Powering off the
+          # runner kills the job before the backup runs. Use Log Out instead.
+          sudo tee /etc/polkit-1/rules.d/10-no-poweroff.rules > /dev/null <<'EOF'
+          polkit.addRule(function (action, subject) {
+            if (subject.user == "rdpuser" &&
+                /^org\.freedesktop\.login1\.(power-off|reboot|halt|suspend|hibernate)/.test(action.id)) {
+              return polkit.Result.NO;
+            }
+          });
+          EOF
+
+          # ---- GNOME Remote Desktop (GNOME's own RDP server, like Windows RDP) ----
+          # It streams a headless GNOME Shell (Wayland) session. The session is
+          # started the same way GDM would, with GNOME Shell in headless mode.
+          sudo mkdir -p /etc/systemd/user/org.gnome.Shell@wayland.service.d
+          sudo tee /etc/systemd/user/org.gnome.Shell@wayland.service.d/10-headless.conf > /dev/null <<'EOF'
+          [Service]
+          ExecStart=
+          ExecStart=/usr/bin/gnome-shell --headless
+          EOF
+
+          # Start the headless RDP server with the session; never the screen-share one.
+          sudo mkdir -p /etc/systemd/user/gnome-session.target.wants
+          sudo ln -sf /usr/lib/systemd/user/gnome-remote-desktop-headless.service \
+            /etc/systemd/user/gnome-session.target.wants/gnome-remote-desktop-headless.service
+          sudo ln -sf /dev/null /etc/systemd/user/gnome-remote-desktop.service
+
+          # TLS certificate and login for RDP (user rdpuser, password VNC_PASSWORD).
+          GRD_DIR=/home/rdpuser/.local/share/gnome-remote-desktop
+          sudo -u rdpuser mkdir -p "$GRD_DIR"
+          if [[ ! -f "$GRD_DIR/rdp-tls.crt" ]]; then
+            sudo -u rdpuser openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+              -subj "/CN=github-gnome" \
+              -keyout "$GRD_DIR/rdp-tls.key" -out "$GRD_DIR/rdp-tls.crt" 2>/dev/null
+          fi
+          sudo -u rdpuser -H env -u XDG_CONFIG_HOME dbus-run-session -- sh -c "
+            grdctl --headless rdp set-tls-cert '$GRD_DIR/rdp-tls.crt' &&
+            grdctl --headless rdp set-tls-key '$GRD_DIR/rdp-tls.key' &&
+            grdctl --headless rdp set-credentials rdpuser '$VNC_PASSWORD' &&
+            grdctl --headless rdp disable-view-only &&
+            grdctl --headless rdp enable &&
+            grdctl --headless status"
+
+          # Login session for rdpuser through PAM/logind (like a real login),
+          # which runs the Ubuntu GNOME session on Wayland.
+          sudo tee /etc/systemd/system/gnome-rdp-session.service > /dev/null <<'EOF'
+          [Unit]
+          Description=Headless Ubuntu GNOME session for RDP
+          After=systemd-user-sessions.service dbus.service
+
+          [Service]
+          User=rdpuser
+          PAMName=login
+          WorkingDirectory=/home/rdpuser
+          Environment=XDG_SESSION_TYPE=wayland
+          Environment=XDG_SESSION_CLASS=user
+          Environment=XDG_CURRENT_DESKTOP=ubuntu:GNOME
+          Environment=XDG_SESSION_DESKTOP=ubuntu
+          Environment=DESKTOP_SESSION=ubuntu
+          Environment=GNOME_SHELL_SESSION_MODE=ubuntu
+          Environment=XDG_CONFIG_DIRS=/etc/xdg/xdg-ubuntu:/etc/xdg
+          Environment=XDG_DATA_DIRS=/usr/share/ubuntu:/usr/local/share:/usr/share
+          ExecStart=/usr/bin/gnome-session --session=ubuntu
+          Restart=no
+          EOF
+          sudo systemctl daemon-reload
+
+      - name: Start GNOME session and RDP server
+        id: rdp
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          # Allow RDP (3389) only from loopback (frpc forwards it); drop everything else.
+          for ipt in iptables ip6tables; do
+            sudo "$ipt" -I INPUT 1 -p tcp --dport 3389 -j DROP
+            sudo "$ipt" -I INPUT 1 -p tcp --dport 3389 -i lo -j ACCEPT
+          done
+
+          sudo systemctl start gnome-rdp-session.service
+          RUID=$(id -u rdpuser)
+          as_user() { sudo -u rdpuser XDG_RUNTIME_DIR="/run/user/$RUID" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$RUID/bus" "$@"; }
+
+          for i in {1..40}; do
+            pgrep -u rdpuser -x gnome-shell >/dev/null && break
+            sleep 3
+          done
+          # If the session did not pull in the RDP server, start it directly.
+          for i in {1..20}; do
+            sudo ss -ltn 'sport = :3389' | grep -q LISTEN && break
+            (( i == 5 )) && as_user systemctl --user start gnome-remote-desktop-headless.service || true
+            sleep 3
+          done
+
+          loginctl list-sessions --no-legend || true
+          pgrep -u rdpuser -a 'gnome-shell|gnome-remote-desktop' || true
+          if sudo ss -ltn 'sport = :3389' | grep -q LISTEN; then
+            echo "started=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "RDP server did not start. Logs:"
+            sudo journalctl -u gnome-rdp-session --no-pager -n 60 || true
+            sudo journalctl _UID="$RUID" --no-pager -n 120 || true
+            exit 1
+          fi
+
+      - name: Verify RDP listener
+        shell: bash
+        run: |
+          for i in {1..20}; do
+            if timeout 3 bash -c "</dev/tcp/127.0.0.1/3389" 2>/dev/null; then
+              echo "RDP is listening and forwarded to the relay."
+              pgrep -u rdpuser -x gnome-shell >/dev/null && echo "GNOME Shell is running." || echo "WARNING: gnome-shell not running"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "RDP is not listening."
+          exit 1
+
+      - name: Print connection details
+        shell: bash
+        env:
+          FRP_SERVER: ${{ secrets.FRP_SERVER }}
+        run: |
+          echo "=========================================="
+          echo "GNOME DESKTOP READY (RDP)"
+          echo "RDP server : ${FRP_SERVER}:13390"
+          echo "User       : rdpuser"
+          echo "Password   : GitHub secret VNC_PASSWORD"
+          echo "=========================================="
+          echo "Public relay:      Remmina > RDP, server ${FRP_SERVER}:13390"
+          echo "SSH-tunnel relay:  Remmina > RDP, server 127.0.0.1:13390, SSH Tunnel tab = your VM"
+          echo "Linux: KRB5_CONFIG=/dev/null xfreerdp3 /v:${FRP_SERVER}:13390 /u:rdpuser /cert:tofu /dynamic-resolution +clipboard /network:auto /gfx /f"
+          echo "End the session with Log Out (power off is disabled)."
+
+      - name: Keep desktop alive
+        shell: bash
+        run: |
+          # Stay up until 330 minutes after job start (20 min left for backup).
+          # Logging out of GNOME ends the session and goes straight to backup.
+          # Closing the RDP window only disconnects; the session keeps running.
+          deadline=$(( JOB_START + 330 * 60 ))
+          down=0
+          while (( $(date +%s) < deadline )); do
+            if systemctl is-active --quiet gnome-rdp-session.service; then
+              down=0
+            else
+              down=$((down + 1))
+              if (( down >= 2 )); then
+                echo "GNOME session ended (logged out). Starting backup."
+                exit 0
+              fi
+            fi
+            left=$(( (deadline - $(date +%s)) / 60 ))
+            echo "[$(date '+%H:%M:%S')] GNOME running — ${left} min left before backup"
+            sleep 60
+          done
+
+      - name: Stop session before backup
+        if: always()
+        shell: bash
+        run: |
+          sudo systemctl stop gnome-rdp-session.service 2>/dev/null || true
+          sudo systemctl stop frpc 2>/dev/null || true
+          sudo loginctl terminate-user rdpuser 2>/dev/null || true
+          sleep 3
+
+      - name: Create encrypted home backup
+        id: backup
+        if: always() && steps.rdp.outputs.started == 'true'
+        shell: bash
+        env:
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "$BACKUP_PASSPHRASE" ]]; then
+            echo "Missing BACKUP_PASSPHRASE; refusing to upload an unencrypted backup."
+            exit 1
+          fi
+
+          sudo tar -czf /tmp/home.tar.gz \
+            --exclude='./.cache' \
+            --exclude='./.vnc' \
+            --exclude='./.ssh' \
+            --exclude='./.Xauthority' \
+            --exclude='./.ICEauthority' \
+            --exclude='./.local/share/Trash' \
+            --exclude='./.local/share/keyrings' \
+            -C /home/rdpuser .
+
+          printf '%s' "$BACKUP_PASSPHRASE" | \
+            sudo gpg --batch --yes --pinentry-mode loopback \
+              --passphrase-fd 0 \
+              --symmetric --cipher-algo AES256 \
+              --output /tmp/home.tar.gz.gpg \
+              /tmp/home.tar.gz
+
+          sudo chmod 644 /tmp/home.tar.gz.gpg
+          sudo rm -f /tmp/home.tar.gz
+          echo "Encrypted backup ready."
+
+      - name: Upload persistent home backup
+        if: always() && steps.backup.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: desktop-home-backup
+          path: /tmp/home.tar.gz.gpg
+          if-no-files-found: error
